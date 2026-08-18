@@ -20,6 +20,12 @@ is unsure is an orchestrator nobody leaves running.
 
 Every escalation is one question with 2-4 concrete options. See
 ``schemas.Question`` for why.
+
+``run_task`` runs headless by default and drives the terminal. It also accepts
+three optional hooks -- ``on_progress``, ``on_escalation``, ``stop_flag`` -- so
+a UI or another process can observe the run, answer its questions, and cancel
+it. The hooks are strictly additive: none of them can change a decision, and
+with all three omitted the loop behaves exactly as it did before they existed.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -107,9 +114,16 @@ class RunState:
     escalations: List[Dict[str, Any]] = field(default_factory=list)
 
 
-# --- asking the user -------------------------------------------------------
+# --- talking to whoever is driving -----------------------------------------
 
+# The loop's own asker: an option index, or None meaning "no answer, stop".
 AnswerFn = Callable[[Question], Optional[int]]
+
+# Embedder-facing hooks. Deliberately narrower than the internals they wrap:
+# progress is one-way, and an escalation answer is a label the caller saw --
+# neither can express an action the Controller did not already offer.
+ProgressFn = Callable[[str, Dict[str, Any]], None]
+EscalationFn = Callable[[Question], str]
 
 
 def ask_on_console(question: Question) -> Optional[int]:
@@ -136,6 +150,60 @@ def ask_on_console(question: Question) -> Optional[int]:
         if raw.isdigit() and 1 <= int(raw) <= len(question.options):
             return int(raw) - 1
         console.print("[red]شماره‌ی نامعتبر.[/red]")
+
+
+def _asker_from_escalation(on_escalation: EscalationFn) -> AnswerFn:
+    """Adapt an embedder's label-returning hook to the loop's index-returning one.
+
+    The hook returns what the user picked, as text, because that is what a UI
+    naturally has. Matching it back to an option index happens here so the
+    state machine keeps its single notion of an answer.
+
+    An unrecognised answer becomes ``None`` -- the same as no answer, i.e.
+    stop. Coercing it to a default would let a UI bug spend money or abandon a
+    run without anyone having chosen either.
+    """
+
+    def ask(question: Question) -> Optional[int]:
+        answer = on_escalation(question)
+        if answer is None:
+            return None
+        answer = str(answer).strip()
+        if not answer:
+            return None
+        options = question.options
+        if answer in options:
+            return options.index(answer)
+        folded = [option.strip().casefold() for option in options]
+        if answer.casefold() in folded:
+            return folded.index(answer.casefold())
+        # A bare "1".."4" is what a CLI-ish front end tends to send back.
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return int(answer) - 1
+        console.print(f"[yellow]unrecognised escalation answer: {answer!r} -- stopping[/yellow]")
+        return None
+
+    return ask
+
+
+def _progress_emitter(on_progress: Optional[ProgressFn]) -> ProgressFn:
+    """Wrap the progress hook so a broken observer cannot kill a paid run.
+
+    Reporting is not part of the work. A UI callback that raises -- a closed
+    websocket, a dead queue -- gets its exception surfaced on the console and
+    the loop carries on, because the alternative is discarding a run mid-flight
+    over a rendering problem.
+    """
+    if on_progress is None:
+        return lambda event, data: None
+
+    def emit(event: str, data: Dict[str, Any]) -> None:
+        try:
+            on_progress(event, data)
+        except Exception as exc:  # noqa: BLE001 -- observers must not be fatal
+            console.print(f"[yellow]on_progress({event}) raised {exc!r}; continuing[/yellow]")
+
+    return emit
 
 
 def _escalate(
@@ -177,17 +245,62 @@ def run_task(
     cwd: Optional[str] = None,
     ask: AnswerFn = ask_on_console,
     run_id: Optional[str] = None,
+    on_progress: Optional[ProgressFn] = None,
+    on_escalation: Optional[EscalationFn] = None,
+    stop_flag: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
+    """Run the Manager/Worker/Critic loop to acceptance, exhaustion or halt.
+
+    The three optional hooks let another process drive this loop without
+    changing it:
+
+    ``on_progress(event, data)``
+        Called after each stage -- ``round_start``, ``manager_plan``,
+        ``worker_output``, ``critic_verdict``, ``run_end``. Observation only;
+        the return value is ignored and an exception is not fatal. The JSONL
+        log remains the record of truth, unchanged.
+
+    ``on_escalation(question) -> str``
+        Replaces the terminal prompt at all three triggers. Returns the label
+        the user picked; anything unrecognised is treated as no answer, which
+        means stop.
+
+    ``stop_flag``
+        Checked at the top of each round. When set, the run ends with status
+        ``stopped_by_flag`` and returns the state it had reached.
+
+    With all three omitted this is the original headless behaviour, down to the
+    console prompts.
+    """
     run_id = run_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     log = RunLog(run_id)
     state = RunState(task=task, budget=BudgetGuard(limit_usd=task.budget_usd))
+    emit = _progress_emitter(on_progress)
+    if on_escalation is not None:
+        ask = _asker_from_escalation(on_escalation)
     log.write("run_start", task=task.model_dump())
     started = time.time()
 
     status = "max_rounds"
     while state.round < task.max_rounds:
+        # Cancellation is checked before the round is counted and before any
+        # money is spent, so a stopped run is never charged for work nobody
+        # will read.
+        if stop_flag is not None and stop_flag.is_set():
+            status = "stopped_by_flag"
+            break
+
         state.round += 1
         console.rule(f"دور {state.round} / {task.max_rounds}")
+        emit(
+            "round_start",
+            {
+                "round": state.round,
+                "max_rounds": task.max_rounds,
+                "spent_usd": state.budget.spent_usd,
+                "limit_usd": state.budget.limit_usd,
+            },
+        )
 
         # Trigger 3, checked first and before any call: the previous round
         # may have crossed the line, and the cheapest possible reaction is to
@@ -239,6 +352,19 @@ def run_task(
             output_tokens=entry.output_tokens,
         )
         console.print(Panel(plan.plan, title=f"نقشه‌ی Manager ({plan.worker_type})", border_style="cyan"))
+        emit(
+            "manager_plan",
+            {
+                "round": state.round,
+                "plan": plan.plan,
+                "worker_prompt": plan.worker_prompt,
+                "acceptance_criteria": list(plan.acceptance_criteria),
+                "worker_type": plan.worker_type,
+                "needs_user_input": plan.needs_user_input,
+                "cost_usd": entry.cost_usd,
+                "model": entry.model,
+            },
+        )
 
         # Trigger 2. The Manager reports; the Controller decides -- and the
         # question comes from the Manager because it is the role that knows
@@ -285,6 +411,19 @@ def run_task(
             cost_usd=entry.cost_usd,
             model=entry.model,
         )
+        emit(
+            "worker_output",
+            {
+                "round": state.round,
+                "worker_type": plan.worker_type,
+                "ok": run.output.ok,
+                "result": run.output.result,
+                "notes": run.output.notes,
+                "failure_reason": run.failure_reason,
+                "cost_usd": entry.cost_usd,
+                "model": entry.model,
+            },
+        )
 
         # --- Critic --------------------------------------------------------
         if not run.output.ok:
@@ -314,6 +453,18 @@ def run_task(
                 title="نظر Critic",
                 border_style="magenta" if verdict.verdict != "accept" else "green",
             )
+        )
+        emit(
+            "critic_verdict",
+            {
+                "round": state.round,
+                "score": verdict.score,
+                "verdict": verdict.verdict,
+                "met_criteria": list(verdict.met_criteria),
+                "failed_criteria": list(verdict.failed_criteria),
+                "fix_instruction": verdict.fix_instruction,
+                "spent_usd": state.budget.spent_usd,
+            },
         )
 
         if verdict.score > state.best_score:
@@ -368,6 +519,7 @@ def run_task(
         "duration_s": round(time.time() - started, 2),
     }
     log.write("run_end", **{k: v for k, v in summary.items() if k != "result"})
+    emit("run_end", dict(summary))
     return summary
 
 

@@ -46,13 +46,20 @@ def build_user_message(plan: ManagerPlan, output: WorkerOutput) -> str:
 
 
 def review(plan: ManagerPlan, output: WorkerOutput) -> Tuple[CriticVerdict, ProviderResult]:
+    """Grade one Worker output against the plan's acceptance criteria."""
     result = google.call_structured(
         CriticVerdict,
         system=_system(),
         user=build_user_message(plan, output),
         model=MODEL,
     )
-    return CriticVerdict.model_validate(result.data), result
+    # Gemini expresses "this field is optional" as nullable, and then actually
+    # sends null -- an empty fix_instruction arrives as None rather than "".
+    # Dropping nulls hands the field back to its Pydantic default, which is
+    # what nullable was standing in for. The schema stays as-is: the vendor is
+    # within its rights here, and narrowing the schema would be the wrong fix.
+    data = {key: value for key, value in result.data.items() if value is not None}
+    return CriticVerdict.model_validate(data), result
 
 
 def failed_worker_verdict(reason: str) -> CriticVerdict:
