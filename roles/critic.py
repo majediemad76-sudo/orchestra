@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 
 from providers import ProviderResult, google
 from providers.schema_utils import json_hint
-from schemas import CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
+from schemas import Criterion, CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
 
 from . import load_prompt
 
@@ -36,7 +36,11 @@ def _system() -> str:
 
 
 def build_user_message(plan: ManagerPlan, output: WorkerOutput) -> str:
-    criteria = "\n".join(f"- {c}" for c in plan.acceptance_criteria)
+    criteria = "\n".join(
+        f"{index}. {c.text}\n   critical: {'yes' if c.critical else 'no'}"
+        f"\n   check_method: {c.check_method}"
+        for index, c in enumerate(plan.acceptance_criteria, start=1)
+    )
     return (
         f"دستور داده‌شده به عامل مجری:\n{plan.worker_prompt}"
         f"\n\n---\n\nمعیارهای پذیرش:\n{criteria}"
@@ -59,10 +63,40 @@ def review(plan: ManagerPlan, output: WorkerOutput) -> Tuple[CriticVerdict, Prov
     # what nullable was standing in for. The schema stays as-is: the vendor is
     # within its rights here, and narrowing the schema would be the wrong fix.
     data = {key: value for key, value in result.data.items() if value is not None}
-    return CriticVerdict.model_validate(data), result
+    verdict = CriticVerdict.model_validate(data)
+    return _reassert_criticality(verdict, plan), result
 
 
-def failed_worker_verdict(reason: str, criteria: Optional[List[str]] = None) -> CriticVerdict:
+def _reassert_criticality(verdict: CriticVerdict, plan: ManagerPlan) -> CriticVerdict:
+    """Restore each check's ``critical`` flag from the Manager's plan.
+
+    The Critic is asked to echo the flag so that it judges with the stakes in
+    view, but its echo is never trusted: criticality decides whether a round is
+    accepted, and a judge that can downgrade a criterion it just failed is a
+    judge marking its own homework.
+
+    Matching is by exact criterion text, then by position -- the Critic is told
+    to copy the text verbatim and to keep the order, so the two agree in
+    practice; the positional fallback covers a model that paraphrased. A check
+    that matches neither keeps whatever it was given, which is the
+    conservative outcome only when it was already non-critical, so it is
+    forced to critical when the plan has no room for an extra criterion.
+    """
+    by_text = {criterion.text.strip(): criterion.critical for criterion in plan.acceptance_criteria}
+    for index, check in enumerate(verdict.checks):
+        text = check.criterion.strip()
+        if text in by_text:
+            check.critical = by_text[text]
+        elif index < len(plan.acceptance_criteria):
+            check.critical = plan.acceptance_criteria[index].critical
+        else:
+            check.critical = True
+    return verdict
+
+
+def failed_worker_verdict(
+    reason: str, criteria: Optional[List[Criterion]] = None
+) -> CriticVerdict:
     """Synthesise a rejection for a Worker that produced nothing.
 
     A timeout or a dead CLI is a fact about the round, not an error condition.
@@ -73,12 +107,21 @@ def failed_worker_verdict(reason: str, criteria: Optional[List[str]] = None) -> 
     quote. No Critic call is made either -- there is nothing to grade, and the
     run should not pay to be told so.
     """
-    criteria = criteria or ["worker produced usable output"]
+    criteria = criteria or [
+        Criterion(
+            text="worker produced usable output",
+            critical=True,
+            check_method="the run log records an output",
+        )
+    ]
     return CriticVerdict(
         checks=[
             CriterionCheck(
-                criterion=criterion,
+                criterion=criterion.text,
                 passed=False,
+                # Every criterion is blocking here: there is no output at all,
+                # so this can never be waved through as a cosmetic miss.
+                critical=True,
                 evidence="",
                 reason=f"The worker produced no output to check. {reason}".strip(),
             )

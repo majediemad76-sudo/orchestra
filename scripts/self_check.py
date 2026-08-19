@@ -32,6 +32,7 @@ from providers.schema_utils import (  # noqa: E402
     to_xai_schema,
 )
 from schemas import (  # noqa: E402
+    Criterion,
     CriterionCheck,
     CriticVerdict,
     Escalation,
@@ -43,6 +44,13 @@ from schemas import (  # noqa: E402
 
 FAILURES: List[str] = []
 CHECKS = 0
+
+CRITICAL_CRITERION = Criterion(
+    text="under 150 words", critical=True, check_method="count the words"
+)
+OPTIONAL_CRITERION = Criterion(
+    text="mentions the release date", critical=False, check_method="search for a date"
+)
 
 
 def check(condition: bool, label: str) -> None:
@@ -71,7 +79,7 @@ def check_pydantic_models() -> None:
     plan_without_optional = ManagerPlan(
         plan="p",
         worker_prompt="do the thing",
-        acceptance_criteria=["under 150 words"],
+        acceptance_criteria=[CRITICAL_CRITERION],
         worker_type="text",
     )
     check(plan_without_optional.question is None, "ManagerPlan builds without the optional field")
@@ -80,7 +88,7 @@ def check_pydantic_models() -> None:
     plan_with_optional = ManagerPlan(
         plan="p",
         worker_prompt="do the thing",
-        acceptance_criteria=["under 150 words"],
+        acceptance_criteria=[CRITICAL_CRITERION],
         worker_type="code",
         needs_user_input=True,
         question=Question(text="which one?", options=["a", "b", "c"]),
@@ -109,6 +117,73 @@ def check_pydantic_models() -> None:
     check(CriticVerdict(checks=[], verdict="accept").all_passed is False,
           "an empty check list fails closed")
     check(CriticVerdict(checks=[], verdict="accept").score == 0, "no checks scores 0, not 100")
+
+    # Criterion + the critical-gated accept rule.
+    check(
+        ManagerPlan(plan="p", worker_prompt="w", acceptance_criteria=[CRITICAL_CRITERION],
+                    worker_type="text").acceptance_criteria[0].check_method == "count the words",
+        "ManagerPlan carries structured criteria",
+    )
+    crit_pass = CriterionCheck(criterion="a", passed=True, critical=True, evidence="q", reason="r")
+    crit_fail = CriterionCheck(criterion="a", passed=False, critical=True, evidence="q", reason="r")
+    opt_pass = CriterionCheck(criterion="b", passed=True, critical=False, evidence="q", reason="r")
+    opt_fail = CriterionCheck(criterion="b", passed=False, critical=False, evidence="q", reason="r")
+
+    check(CriticVerdict(checks=[crit_pass, opt_pass], verdict="revise").accepted is True,
+          "everything passing is accepted")
+    check(CriticVerdict(checks=[crit_pass, opt_fail], verdict="revise").accepted is True,
+          "a non-critical failure does not block acceptance")
+    check(CriticVerdict(checks=[crit_fail, opt_pass], verdict="accept").accepted is False,
+          "a critical failure blocks acceptance, whatever the model said")
+    check(CriticVerdict(checks=[opt_fail, opt_pass], verdict="accept").accepted is False,
+          "with nothing marked critical, every criterion must pass")
+    check(CriticVerdict(checks=[], verdict="accept").accepted is False,
+          "an empty check list is never accepted")
+    check(CriticVerdict(checks=[crit_fail, opt_fail], verdict="revise").blocking_failures == ["a"],
+          "blocking_failures lists only the critical ones")
+    check(CriticVerdict(checks=[crit_pass, opt_fail], verdict="revise").score == 50,
+          "the score still counts every criterion, critical or not")
+
+    # The Critic must not be able to reclassify a criterion it just failed.
+    from roles.critic import _reassert_criticality  # noqa: PLC0415
+
+    plan = ManagerPlan(plan="p", worker_prompt="w", worker_type="text",
+                       acceptance_criteria=[CRITICAL_CRITERION, OPTIONAL_CRITERION])
+    tampered = CriticVerdict(
+        checks=[
+            CriterionCheck(criterion=CRITICAL_CRITERION.text, passed=False, critical=False,
+                           evidence="q", reason="r"),
+            CriterionCheck(criterion=OPTIONAL_CRITERION.text, passed=False, critical=True,
+                           evidence="q", reason="r"),
+        ],
+        verdict="accept",
+    )
+    restored = _reassert_criticality(tampered, plan)
+    check(restored.checks[0].critical is True and restored.checks[1].critical is False,
+          "criticality is restored from the plan, not taken from the Critic")
+    check(restored.accepted is False, "a downgraded critical failure still blocks acceptance")
+
+    paraphrased = CriticVerdict(
+        checks=[CriterionCheck(criterion="under 150 words (roughly)", passed=False,
+                               critical=False, evidence="q", reason="r")],
+        verdict="accept",
+    )
+    check(_reassert_criticality(paraphrased, plan).checks[0].critical is True,
+          "a paraphrased criterion falls back to its position in the plan")
+
+    invented = CriticVerdict(
+        checks=[
+            CriterionCheck(criterion=CRITICAL_CRITERION.text, passed=True, critical=True,
+                           evidence="q", reason="r"),
+            CriterionCheck(criterion=OPTIONAL_CRITERION.text, passed=True, critical=False,
+                           evidence="q", reason="r"),
+            CriterionCheck(criterion="something the Manager never asked for", passed=False,
+                           critical=False, evidence="q", reason="r"),
+        ],
+        verdict="accept",
+    )
+    check(_reassert_criticality(invented, plan).checks[2].critical is True,
+          "a criterion with no counterpart in the plan is treated as critical")
     mixed = CriticVerdict(checks=[passing, failing], verdict="revise")
     check(mixed.met_criteria == ["a"] and mixed.failed_criteria == ["b"], "met/failed derive from checks")
     record = mixed.as_record()
@@ -193,7 +268,11 @@ def check_gemini() -> None:
     check(all(t == t.upper() for t in types), "every type name is upper-case")
     check(schema["type"] == "OBJECT", "top level is OBJECT")
     check(schema["properties"]["acceptance_criteria"]["type"] == "ARRAY", "list maps to ARRAY")
-    check(schema["properties"]["acceptance_criteria"]["items"]["type"] == "STRING", "list items map to STRING")
+    check(
+        schema["properties"]["acceptance_criteria"]["items"]["properties"]["critical"]["type"]
+        == "BOOLEAN",
+        "nested Criterion fields map through the array",
+    )
     check(schema["properties"]["question"].get("nullable") is True, "Optional -> nullable: true")
     check(
         schema["properties"]["needs_user_input"].get("nullable") is True,
@@ -274,7 +353,7 @@ def check_controller_state_machine() -> None:
         plan = ManagerPlan(
             plan="fake plan",
             worker_prompt="write something",
-            acceptance_criteria=["c1"],
+            acceptance_criteria=[CRITICAL_CRITERION],
             worker_type="text",
             needs_user_input=needs_input,
             question=Question(text="which tone?", options=["formal", "casual"]) if needs_input else None,

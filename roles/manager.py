@@ -51,7 +51,10 @@ def build_user_message(
         parts.append(f"دستور دور قبل به عامل مجری:\n{previous_plan.worker_prompt}")
         parts.append(
             "معیارهای پذیرش دور قبل:\n"
-            + "\n".join(f"- {c}" for c in previous_plan.acceptance_criteria)
+            + "\n".join(
+                f"- [{'critical' if c.critical else 'optional'}] {c.text} ({c.check_method})"
+                for c in previous_plan.acceptance_criteria
+            )
         )
     if worker_result:
         parts.append(f"خروجی دور قبل عامل مجری:\n{worker_result[:4000]}")

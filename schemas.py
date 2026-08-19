@@ -62,8 +62,12 @@ class ManagerPlan(BaseModel):
     worker_prompt: str = Field(
         description="Self-contained instruction for the worker. The worker sees no history."
     )
-    acceptance_criteria: List[str] = Field(
-        min_length=1, description="Objectively checkable criteria, not matters of taste."
+    acceptance_criteria: List[Criterion] = Field(
+        min_length=1,
+        description=(
+            "Objectively checkable criteria, not matters of taste. At least one must be "
+            "critical, or nothing is actually being required of the output."
+        ),
     )
     worker_type: Literal["text", "code"] = Field(
         description="'text' routes to the Anthropic API, 'code' routes to Claude Code headless."
@@ -89,6 +93,37 @@ class WorkerOutput(BaseModel):
     ok: bool = Field(default=True, description="False when the worker failed to produce a result.")
 
 
+class Criterion(BaseModel):
+    """One acceptance criterion, written to be checkable rather than admired.
+
+    The Critic can only be as objective as the criteria it is handed. "The
+    tone should be good" cannot be judged twice the same way; "fewer than 150
+    words" can. Forcing the Manager to name a ``check_method`` is what makes
+    that difference explicit at authoring time -- a criterion whose method the
+    Manager cannot state is a criterion nobody can check.
+
+    ``critical`` records how much a violation actually matters, which is a
+    property of the task rather than of the output, so the Manager is the role
+    that knows it.
+    """
+
+    text: str = Field(
+        description=(
+            "The criterion itself. Must be binary, objective and unambiguous: "
+            "two readers checking the same output must reach the same answer."
+        )
+    )
+    critical: bool = Field(
+        description="Whether violating this criterion blocks acceptance of the output."
+    )
+    check_method: str = Field(
+        description=(
+            "How to verify it objectively -- e.g. 'count the words', "
+            "'search for the substring', 'run the test'. Not a restatement of the text."
+        )
+    )
+
+
 class CriterionCheck(BaseModel):
     """One acceptance criterion, judged on its own.
 
@@ -104,6 +139,10 @@ class CriterionCheck(BaseModel):
 
     criterion: str = Field(description="The criterion text, copied exactly as the Manager wrote it.")
     passed: bool = Field(description="Whether the output satisfies this criterion.")
+    critical: bool = Field(
+        default=False,
+        description="Whether this criterion blocks acceptance. Copied from the Manager's plan.",
+    )
     evidence: str = Field(
         description=(
             "A direct quote from the worker's output that settles this criterion, "
@@ -156,12 +195,34 @@ class CriticVerdict(BaseModel):
 
     @property
     def all_passed(self) -> bool:
-        """The acceptance test. An empty check list fails, deliberately.
-
-        A Critic that returned no checks judged nothing, and "nothing was
-        judged" must not read as "everything passed".
-        """
+        """Every criterion held, critical or not. Reporting only -- see ``accepted``."""
         return bool(self.checks) and all(check.passed for check in self.checks)
+
+    @property
+    def blocking_failures(self) -> List[str]:
+        """Critical criteria that failed. These are what stop a round."""
+        return [check.criterion for check in self.checks if check.critical and not check.passed]
+
+    @property
+    def accepted(self) -> bool:
+        """The acceptance test: no critical criterion failed.
+
+        Non-critical failures are recorded, shown and fed back to the Manager,
+        but they do not buy another round. A criterion nobody was willing to
+        call critical should not be able to spend the budget twice.
+
+        Two ways to fail closed. An empty check list judged nothing, and
+        "nothing was judged" must never read as "everything passed". A plan
+        where *no* criterion was marked critical is treated as though all of
+        them were -- otherwise a Manager could make any output acceptable by
+        marking nothing important.
+        """
+        if not self.checks:
+            return False
+        critical = [check for check in self.checks if check.critical]
+        if not critical:
+            return all(check.passed for check in self.checks)
+        return all(check.passed for check in critical)
 
     @property
     def score(self) -> int:
@@ -191,7 +252,9 @@ class CriticVerdict(BaseModel):
         data = self.model_dump()
         data.update(
             score=self.score,
+            accepted=self.accepted,
             all_passed=self.all_passed,
+            blocking_failures=self.blocking_failures,
             met_criteria=self.met_criteria,
             failed_criteria=self.failed_criteria,
         )

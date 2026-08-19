@@ -423,6 +423,9 @@ def _normalise_stage(name: str, event: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "round": event.get("round"),
         "score": verdict.get("score", 0),
+        "accepted": verdict.get("accepted", verdict.get("all_passed", bool(checks) and not failed)),
+        "blocking_failures": verdict.get("blocking_failures")
+        or [c["criterion"] for c in checks if c.get("critical") and not c.get("passed")],
         "all_passed": verdict.get("all_passed", bool(checks) and not failed),
         "verdict": verdict.get("verdict", "?"),
         "checks": checks,
@@ -508,10 +511,12 @@ def _round_headline(number: int, stages: Dict[str, Any]) -> str:
         checks = critic.get("checks") or []
         met = len(critic.get("met_criteria") or [])
         total = len(checks) or (met + len(critic.get("failed_criteria") or []))
-        passed_all = critic.get("all_passed", met == total and total > 0)
-        icon = "✅" if passed_all else VERDICT_ICONS.get(critic.get("verdict"), "🔁")
+        accepted = critic.get("accepted", critic.get("all_passed", met == total and total > 0))
+        icon = "✅" if accepted else VERDICT_ICONS.get(critic.get("verdict"), "🔁")
         detail = f"{met}/{total} criteria" if total else "no criteria judged"
-        return f"{icon}  Round {number} · {detail} · {critic.get('score', 0)}%"
+        blocking = len(critic.get("blocking_failures") or [])
+        suffix = f" · {blocking} blocking" if blocking else ""
+        return f"{icon}  Round {number} · {detail} · {critic.get('score', 0)}%{suffix}"
     if stages["worker"]:
         return f"⏳  Round {number} · reviewing"
     if stages["manager"]:
@@ -530,7 +535,14 @@ def _render_round(number: int, stages: Dict[str, Any], expanded: bool) -> None:
                 st.caption(f"Worker backend: `{manager['worker_type']}`")
             st.markdown("##### ✅ Acceptance Criteria")
             for criterion in manager["acceptance_criteria"]:
-                st.markdown(f"- {criterion}")
+                # Logs written before criteria became objects hold plain strings.
+                if isinstance(criterion, str):
+                    st.markdown(f"- {criterion}")
+                    continue
+                badge = "🔴 critical" if criterion.get("critical") else "⚪ optional"
+                st.markdown(f"- **{criterion.get('text', '?')}** — {badge}")
+                if criterion.get("check_method"):
+                    st.caption(f"How to check: {criterion['check_method']}")
         else:
             st.caption("Waiting…")
 
@@ -562,10 +574,18 @@ def _render_round(number: int, stages: Dict[str, Any], expanded: bool) -> None:
             )
 
             if checks:
+                blocking = critic.get("blocking_failures") or []
                 for item in checks:
                     passed = item.get("passed")
+                    label = item.get("criterion", "?")
+                    if passed:
+                        tag = ""
+                    elif label in blocking or item.get("critical"):
+                        tag = " · 🔴 blocks acceptance"
+                    else:
+                        tag = " · ⚪ non-blocking"
                     with st.container(border=True):
-                        st.markdown(f"{'✅' if passed else '❌'} **{item.get('criterion', '?')}**")
+                        st.markdown(f"{'✅' if passed else '❌'} **{label}**{tag}")
                         evidence = (item.get("evidence") or "").strip()
                         if evidence:
                             st.markdown(f"> {evidence}")

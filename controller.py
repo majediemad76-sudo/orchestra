@@ -18,8 +18,9 @@ timeout counts as a rejection. Hitting the round cap ends the run with a
 report. This is a deliberate narrowing: an orchestrator that asks whenever it
 is unsure is an orchestrator nobody leaves running.
 
-A round is accepted when every acceptance criterion passes its own binary
-check -- see ``schemas.CriticVerdict.all_passed``. There is no score threshold
+A round is accepted when no *critical* acceptance criterion failed its binary
+check -- see ``schemas.CriticVerdict.accepted``. Non-critical misses are logged
+and fed back to the Manager but never buy another round. There is no score threshold
 to tune, and the model's own "accept" does not decide anything.
 
 Every escalation is one question with 2-4 concrete options. See
@@ -363,7 +364,7 @@ def run_task(
                 "round": state.round,
                 "plan": plan.plan,
                 "worker_prompt": plan.worker_prompt,
-                "acceptance_criteria": list(plan.acceptance_criteria),
+                "acceptance_criteria": [c.model_dump() for c in plan.acceptance_criteria],
                 "worker_type": plan.worker_type,
                 "needs_user_input": plan.needs_user_input,
                 "cost_usd": entry.cost_usd,
@@ -470,7 +471,9 @@ def run_task(
             )
         state.verdict = verdict
         lines = [
-            f"{'✓' if check.passed else '✗'} {check.criterion}" for check in verdict.checks
+            f"{'✓' if check.passed else '✗'} {check.criterion}"
+            f"{'' if check.critical else '  (optional)'}"
+            for check in verdict.checks
         ] or ["(the Critic returned no checks)"]
         if verdict.fix_instruction:
             lines += ["", verdict.fix_instruction]
@@ -478,8 +481,9 @@ def run_task(
             Panel(
                 "\n".join(lines),
                 title=f"Critic verdict — {verdict.score}% ({len(verdict.met_criteria)}"
-                f"/{len(verdict.checks)} criteria)",
-                border_style="green" if verdict.all_passed else "magenta",
+                f"/{len(verdict.checks)} criteria)"
+                + (f" — blocked by {len(verdict.blocking_failures)}" if verdict.blocking_failures else ""),
+                border_style="green" if verdict.accepted else "magenta",
             )
         )
         emit(
@@ -487,7 +491,9 @@ def run_task(
             {
                 "round": state.round,
                 "score": verdict.score,
+                "accepted": verdict.accepted,
                 "all_passed": verdict.all_passed,
+                "blocking_failures": list(verdict.blocking_failures),
                 "verdict": verdict.verdict,
                 "checks": [check.model_dump() for check in verdict.checks],
                 "met_criteria": list(verdict.met_criteria),
@@ -500,10 +506,11 @@ def run_task(
         if verdict.score > state.best_score:
             state.best_score, state.best_result = verdict.score, run.output.result
 
-        # The one line that decides a round. Not the model's "accept" -- every
-        # criterion the Manager wrote has to pass on its own. A criterion the
-        # Critic could not judge (an empty check list) fails closed.
-        accepted = verdict.all_passed
+        # The one line that decides a round. Not the model's "accept" -- a round
+        # is accepted when no *critical* criterion failed. Non-critical misses
+        # are recorded and fed back, but they do not buy another round. See
+        # CriticVerdict.accepted for the two fail-closed cases.
+        accepted = verdict.accepted
         if accepted:
             state.consecutive_rejections = 0
             status = "accepted"
