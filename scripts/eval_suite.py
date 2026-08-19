@@ -72,7 +72,19 @@ class TaskResult:
     result_preview: str = ""
 
 
-def load_tasks(path: Path, only: list[str]) -> list[dict[str, Any]]:
+def load_tasks(path: Path, only: list[str], grading: str = "auto") -> list[dict[str, Any]]:
+    """Read the task file, keeping only the ones this run is meant to grade.
+
+    A task carries ``grading: "manual"`` when no mechanical check can settle
+    it -- "does this email avoid blaming the customer?" has no substring or
+    word count that decides it. Those tasks are filtered out here, in the
+    loader, rather than inside ``grade()``: the mechanical pass rate has to
+    stay a count of mechanically verified things, and mixing in tasks that a
+    person still has to read would quietly inflate it.
+
+    Filtering here also leaves ``grade()`` untouched, which matters -- it is
+    the one function whose meaning the whole benchmark rests on.
+    """
     tasks = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -85,6 +97,9 @@ def load_tasks(path: Path, only: list[str]) -> list[dict[str, Any]]:
         if "id" not in spec or "goal" not in spec:
             raise SystemExit(f"{path}:{line_no}: every task needs an 'id' and a 'goal'")
         if only and spec["id"] not in only:
+            continue
+        task_grading = spec.get("grading", "auto")
+        if grading != "all" and task_grading != grading:
             continue
         tasks.append(spec)
     if not tasks:
@@ -215,6 +230,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--only", action="append", default=[], help="run just this task id (repeatable)"
     )
+    parser.add_argument(
+        "--grading", choices=["auto", "manual", "all"], default="auto",
+        help=(
+            "which tasks to run. 'auto' (the default) is the mechanical benchmark; "
+            "'manual' runs the tasks whose criteria only a person can settle."
+        ),
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--yes", action="store_true", help="skip the spend confirmation")
     args = parser.parse_args(argv)
@@ -225,8 +247,14 @@ def main(argv: list[str] | None = None) -> int:
         console.print("this harness calls the real APIs; copy .env.example to .env first")
         return 2
 
-    specs = load_tasks(args.tasks, args.only)
+    specs = load_tasks(args.tasks, args.only, args.grading)
     worst_case = sum(spec.get("budget_usd", 0.15) for spec in specs)
+    if args.grading != "auto":
+        console.print(
+            f"[yellow]grading={args.grading}: manual tasks are reported, not scored. "
+            "Their pass/fail column is only the mechanical checks they happen to "
+            "carry -- read the Critic's evidence before believing it.[/yellow]"
+        )
     console.print(
         f"[bold]{len(specs)} tasks[/bold] · worst case ${worst_case:.2f} "
         f"if every task burns its ceiling · suite ceiling ${args.budget:.2f}"
