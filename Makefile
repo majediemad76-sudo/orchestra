@@ -13,10 +13,15 @@ RUN_BUDGET ?= 0.10
 RUN_ROUNDS ?= 2
 # Ceiling for the whole eval suite, not per task.
 EVAL_BUDGET ?= 1.00
+# Fixture drafting: how many accepted runs to mine, and the ceiling for the job.
+FIXTURE_RUNS   ?= 10
+FIXTURE_BUDGET ?= 0.50
+# Extra flags, e.g. FIXTURE_FLAGS=--yes for a non-interactive shell.
+FIXTURE_FLAGS  ?=
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check lint run ui eval clean distclean
+.PHONY: help venv install test check lint run ui eval fixture clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -46,6 +51,10 @@ ui: ## Launch the Streamlit observer UI
 eval: ## Run the eval suite against the live APIs -- costs money, needs .env
 	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
 	$(PY) scripts/eval_suite.py --budget $(EVAL_BUDGET)
+
+fixture: ## Draft critic fixtures from accepted runs -- costs money, needs .env
+	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
+	$(PY) scripts/make_fixtures.py --limit $(FIXTURE_RUNS) --budget $(FIXTURE_BUDGET) $(FIXTURE_FLAGS)
 
 clean: ## Remove bytecode caches and self-check run logs
 	@find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} +

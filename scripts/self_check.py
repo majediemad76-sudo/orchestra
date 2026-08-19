@@ -463,6 +463,105 @@ def check_controller_state_machine() -> None:
         controller.RUNS_DIR = saved_runs
 
 
+def check_fixture_builder() -> None:
+    """The three ways the fixture generator lost paid-for work.
+
+    Every one of these was a live failure, not a hypothetical: mutations were
+    generated, billed, and thrown away. They are cheap to re-break and
+    expensive to notice, so they are pinned here.
+    """
+    print("\n[9] Fixture builder (scripts/make_fixtures.py)")
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import make_fixtures as mf  # noqa: PLC0415
+
+    source = mf.RunSource(
+        run_id="r", path="p", goal="g", worker_prompt="w",
+        criteria=[
+            {"text": "The output consists of exactly one sentence.", "critical": True, "check_method": ""},
+            {"text": "fewer than 17 words", "critical": True, "check_method": ""},
+        ],
+        output="the original text", criteria_format="structured",
+    )
+    stats = mf.Stats()
+
+    def mutation(**kwargs):
+        base = dict(mutation_type="factual", broken_criterion_index=1,
+                    broken_criterion="x", mutated_output="changed", explanation="e")
+        base.update(kwargs)
+        return mf.Mutation(**base)
+
+    # 1. The criterion is resolved by index; a paraphrased echo cannot mislabel it.
+    resolved = mf.validate(mutation(broken_criterion_index=2, broken_criterion="Use one sentence."),
+                           source, stats)
+    check(resolved is not None and resolved.broken_criterion == "fewer than 17 words",
+          "the criterion index wins over a paraphrased echo")
+    check(
+        mf.validate(mutation(broken_criterion_index=99, broken_criterion=" Fewer than 17 words. "),
+                    source, stats).broken_criterion == "fewer than 17 words",
+        "an out-of-range index falls back to normalised text",
+    )
+    check(mf.validate(mutation(broken_criterion_index=99, broken_criterion="keep it short"),
+                      source, stats) is None,
+          "an unmatched paraphrase is dropped, never guessed at")
+    check(mf.validate(mutation(mutated_output="the original text"), source, stats) is None,
+          "a mutation that changed nothing is dropped")
+    check(mf.validate(mutation(mutation_type="vibes"), source, stats) is None,
+          "an unknown mutation type is dropped")
+
+    # 2. A payload whose list arrived as a JSON string is recovered.
+    item = {"mutation_type": "factual", "broken_criterion_index": 1,
+            "broken_criterion": "c", "mutated_output": "o", "explanation": "e"}
+    for shape in (
+        {"mutations": json.dumps({"mutations": [item]})},
+        {"mutations": json.dumps([item])},
+        {"mutations": [item]},
+    ):
+        unwrapped = mf._unwrap(shape)
+        check(isinstance(unwrapped["mutations"], list) and len(unwrapped["mutations"]) == 1,
+              "a stringified mutations payload is recovered")
+    check(mf._unwrap({"mutations": "not json at all"})["mutations"] == "not json at all",
+          "an unparseable payload is left alone rather than mangled")
+
+    # 3. One malformed entry must not discard the batch it arrived with.
+    from unittest.mock import patch  # noqa: PLC0415
+
+    from providers import ProviderResult  # noqa: PLC0415
+
+    payload = {"mutations": [item, {**item, "broken_criterion_index": ""}, {**item, "mutation_type": "tone"}]}
+    with patch.object(mf.anthropic, "call_structured",
+                      return_value=ProviderResult(data=payload, model="claude-sonnet-5",
+                                                  input_tokens=10, output_tokens=10)):
+        kept, problems, _, _ = mf.request_mutations(source, ["factual"], "claude-sonnet-5", 100)
+    check(len(kept) == 2 and len(problems) == 1,
+          "one malformed mutation is skipped, the rest of the batch survives")
+
+    # Accepted runs only -- a run the user waved through is not an accept case.
+    import tempfile  # noqa: PLC0415
+
+    tmp = Path(tempfile.mkdtemp())
+    def write_log(name, status):
+        events = [
+            {"event": "run_start", "task": {"goal": "g"}},
+            {"event": "manager_plan", "round": 1, "plan": {"worker_prompt": "w",
+             "acceptance_criteria": [{"text": "c", "critical": True, "check_method": "m"}]}},
+            {"event": "worker_output", "round": 1, "ok": True, "result": "the output"},
+            {"event": "run_end", "status": status},
+        ]
+        (tmp / name).write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    write_log("20260101-000000-a.jsonl", "accepted")
+    write_log("20260101-000001-b.jsonl", "accepted_by_user")
+    write_log("20260101-000002-c.jsonl", "max_rounds")
+    found = mf.read_accepted_runs(tmp, include_evals=True)
+    check([f.run_id for f in found] == ["20260101-000000-a"],
+          "only Critic-accepted runs become accept fixtures")
+
+    # Legacy string criteria are promoted rather than discarded.
+    legacy, fmt = mf._normalise_criteria(["under 150 words", "no jargon"])
+    check(fmt == "legacy" and legacy[0] == {"text": "under 150 words", "critical": True, "check_method": ""},
+          "legacy string criteria are promoted to critical, not dropped")
+
+
 def check_no_hardcoded_keys() -> None:
     print("\n[8] No hard-coded keys")
     import re
@@ -493,6 +592,7 @@ def main() -> int:
     check_ref_resolution()
     check_budget()
     check_controller_state_machine()
+    check_fixture_builder()
     check_no_hardcoded_keys()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

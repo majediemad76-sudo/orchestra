@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 runs/*.jsonl
 evals/results/*.json
+evals/critic_fixtures_draft.jsonl
