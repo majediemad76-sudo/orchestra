@@ -41,7 +41,7 @@ from rich.table import Table
 from budget import BudgetGuard
 from providers.retry_utils import ProviderError
 from roles import critic as critic_role
-from schemas import Criterion, ManagerPlan, WorkerOutput
+from schemas import Criterion, CriticVerdict, ManagerPlan, WorkerOutput
 
 DEFAULT_FIXTURES = ROOT / "evals" / "critic_fixtures.jsonl"
 DEFAULT_RESULTS = ROOT / "evals" / "results"
@@ -106,25 +106,50 @@ def as_plan(row: dict[str, Any]) -> ManagerPlan:
     )
 
 
-def judge(row: dict[str, Any], budget: BudgetGuard) -> Outcome:
+def is_correct(expected: str, accepted: bool) -> bool:
+    """Did the Critic agree with the fixture?
+
+    Pulled out of the loop so it can be tested without spending anything, and
+    so the negative control below exercises the same rule the real run uses.
+    """
+    return accepted if expected == "accept" else not accepted
+
+
+def invert(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flip every fixture's expected verdict, for the negative control.
+
+    A suite that reports 100% is either measuring a good judge or measuring
+    nothing. Inverting the ground truth separates the two: the same fixtures,
+    the same code path, an answer key that is now wrong everywhere. If the
+    score does not collapse, the harness is scoring itself rather than the
+    Critic.
+
+    Benign rows invert to "revise" and broken rows to "accept", which is what
+    makes this a control rather than a second opinion.
+    """
+    flipped = []
+    for row in rows:
+        copy = dict(row)
+        copy["expected_verdict"] = "revise" if row["expected_verdict"] == "accept" else "accept"
+        flipped.append(copy)
+    return flipped
+
+
+def grade_outcome(row: dict[str, Any], verdict: CriticVerdict) -> Outcome:
+    """Score one verdict against one fixture. Pure: no network, no budget.
+
+    Kept separate from ``judge`` so the scoring rule can be exercised with a
+    hand-built ``CriticVerdict`` -- which is how the negative control runs on
+    every gate without an API key or a cent of spend.
+    """
     outcome = Outcome(
         fixture_id=row["fixture_id"],
         expected=row["expected_verdict"],
         mutation_type=row.get("mutation_type"),
     )
-    try:
-        verdict, call = critic_role.review(as_plan(row), WorkerOutput(result=row["output"]))
-    except (ProviderError, ValueError) as exc:
-        outcome.error = f"{type(exc).__name__}: {exc}"
-        return outcome
-
-    entry = budget.charge(row["fixture_id"][:40], call.model, call.input_tokens, call.output_tokens)
-    outcome.cost_usd = entry.cost_usd
     outcome.accepted = verdict.accepted
     outcome.score = verdict.score
-    outcome.correct = (
-        verdict.accepted if row["expected_verdict"] == "accept" else not verdict.accepted
-    )
+    outcome.correct = is_correct(row["expected_verdict"], verdict.accepted)
 
     named = row.get("broken_criterion")
     if named:
@@ -134,6 +159,24 @@ def judge(row: dict[str, Any], budget: BudgetGuard) -> Outcome:
         # sends the next round chasing the wrong problem.
         failed = {c.criterion.strip() for c in verdict.checks if not c.passed}
         outcome.caught_named_criterion = named.strip() in failed
+    return outcome
+
+
+def judge(row: dict[str, Any], budget: BudgetGuard) -> Outcome:
+    """Ask the real Critic about one fixture, then grade what came back."""
+    try:
+        verdict, call = critic_role.review(as_plan(row), WorkerOutput(result=row["output"]))
+    except (ProviderError, ValueError) as exc:
+        return Outcome(
+            fixture_id=row["fixture_id"],
+            expected=row["expected_verdict"],
+            mutation_type=row.get("mutation_type"),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    entry = budget.charge(row["fixture_id"][:40], call.model, call.input_tokens, call.output_tokens)
+    outcome = grade_outcome(row, verdict)
+    outcome.cost_usd = entry.cost_usd
     return outcome
 
 
@@ -229,6 +272,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=float, default=0.50)
     parser.add_argument("--out", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--include-unreviewed", action="store_true")
+    parser.add_argument(
+        "--negative-control", action="store_true",
+        help="invert every expected verdict; the run must then score zero",
+    )
     parser.add_argument("--limit", type=int, default=0, help="judge only the first N fixtures")
     parser.add_argument(
         "--delay", type=float, default=4.0,
@@ -252,6 +299,13 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         console.print("[red]no reviewed fixtures to run[/red]")
         return 1
+
+    if args.negative_control:
+        rows = invert(rows)
+        console.print(
+            "[yellow]negative control: every expected verdict is inverted. "
+            "A correct harness scores 0% here.[/yellow]"
+        )
 
     accepts = sum(1 for r in rows if r["expected_verdict"] == "accept")
     console.print(
@@ -294,7 +348,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    out_path = args.out / f"critic-{stamp}.json"
+    prefix = "critic-negative-control" if args.negative_control else "critic"
+    out_path = args.out / f"{prefix}-{stamp}.json"
     out_path.write_text(
         json.dumps(
             {
@@ -308,6 +363,22 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     console.print(f"report: {out_path}")
+
+    if args.negative_control:
+        judged = [o for o in report.outcomes if not o.error]
+        agreed = sum(o.correct for o in judged)
+        if agreed:
+            # Under an inverted key, "correct" means the Critic disagreed with
+            # the real fixture -- so these are the cases it genuinely got wrong
+            # in the normal run, not evidence that the harness is broken.
+            console.print(
+                f"[yellow]{agreed}/{len(judged)} still scored correct under the inverted key; "
+                "those are the fixtures the Critic gets wrong in a normal run[/yellow]"
+            )
+        else:
+            console.print("[green]negative control passed: the score collapsed to 0%[/green]")
+        return 0 if not report.errors else 1
+
     return 0 if not report.errors else 1
 
 

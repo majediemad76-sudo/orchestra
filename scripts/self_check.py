@@ -612,12 +612,266 @@ def check_fixture_builder() -> None:
     check([f.run_id for f in found] == ["20260101-000000-a"],
           "only Critic-accepted runs become accept fixtures")
 
+    # Benign mutations are machine-verified before they may claim "accept".
+    benign_criteria = [
+        {"text": "The output has fewer than 17 words."},
+        {"text": "The output consists of exactly one sentence."},
+        {"text": "Output contains exactly three non-empty lines and no other lines."},
+        {"text": "The output contains the word task (case-insensitive)."},
+        {"text": "The output does not contain the phrase the thing that (case-insensitive)."},
+        {"text": "The output is in English."},
+    ]
+    one_line = [c for c in benign_criteria if "lines" not in c["text"]]
+
+    check(
+        mf.machine_violations("The system takes a task and then performs it.", one_line) == [],
+        "a genuinely benign rewrite passes the machine check",
+    )
+    check(
+        bool(mf.machine_violations("The system " + "very " * 20 + "takes a task.", one_line)),
+        "a word-count breach is caught",
+    )
+    check(
+        bool(mf.machine_violations("The system takes a task. It performs it.", one_line)),
+        "a sentence-count breach is caught",
+    )
+    check(
+        bool(mf.machine_violations("The system takes it and performs it.", one_line)),
+        "a missing required word is caught",
+    )
+    check(
+        bool(mf.machine_violations("The system takes the thing that is a task.", one_line)),
+        "a forbidden phrase is caught",
+    )
+    check(
+        bool(
+            mf.machine_violations(
+                "Le système prend une tâche dans la file avec le modèle.", one_line
+            )
+        ),
+        "a language switch is caught",
+    )
+    check(
+        bool(mf.machine_violations("a\nb", [c for c in benign_criteria if "lines" in c["text"]])),
+        "a line-count breach is caught, spelled out or in digits",
+    )
+    check(
+        mf.machine_violations("anything at all", [{"text": "The tone should feel welcoming."}])
+        == [],
+        "a criterion it cannot parse is left alone rather than guessed at",
+    )
+
+    benign = mf.Mutation(
+        mutation_type="benign", broken_criterion_index=0, broken_criterion="",
+        mutated_output="The system takes a task. It then performs it.", explanation="e",
+    )
+    benign_source = mf.RunSource(
+        run_id="r", path="p", goal="g", worker_prompt="w",
+        criteria=[{"text": "The output consists of exactly one sentence.", "critical": True,
+                   "check_method": "count the sentences"}],
+        output="The system takes a task and performs it.", criteria_format="structured",
+    )
+    check(
+        mf.validate(benign, benign_source, mf.Stats()) is None,
+        "a benign mutation that violates a criterion is discarded, never saved as accept",
+    )
+    benign.mutated_output = "The system accepts a task and carries it out."
+    check(
+        mf.validate(benign, benign_source, mf.Stats()) is not None,
+        "a benign mutation that violates nothing is kept",
+    )
+
     # Legacy string criteria are promoted rather than discarded.
     legacy, fmt = mf._normalise_criteria(["under 150 words", "no jargon"])
     check(
         fmt == "legacy"
         and legacy[0] == {"text": "under 150 words", "critical": True, "check_method": ""},
         "legacy string criteria are promoted to critical, not dropped",
+    )
+
+
+def check_critic_harness() -> None:
+    """Negative control, run entirely offline against hand-built verdicts.
+
+    A suite reporting 100% is either measuring a good judge or measuring
+    nothing at all. The only way to tell them apart is to feed the grader an
+    answer key that is wrong everywhere and confirm the score collapses.
+
+    No provider is called and nothing is stubbed at the network layer: the
+    ``CriticVerdict`` objects below are constructed here and handed straight to
+    ``eval_critic.grade_outcome``, which is the same function the live run
+    uses. The inverted keys exist only in this function -- the fixture file on
+    disk never contains a wrong expectation.
+    """
+    print("\n[11] Critic harness (offline negative control)")
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import eval_critic as ec
+
+    check(ec.is_correct("accept", accepted=True), "accept fixture + accepted = correct")
+    check(not ec.is_correct("accept", accepted=False), "accept fixture + rejected = wrong")
+    check(ec.is_correct("revise", accepted=False), "revise fixture + rejected = correct")
+    check(not ec.is_correct("revise", accepted=True), "revise fixture + accepted = wrong")
+
+    def verdict(passed: bool) -> CriticVerdict:
+        """A synthetic verdict: one critical criterion, met or not."""
+        return CriticVerdict(
+            checks=[
+                CriterionCheck(
+                    criterion="c1",
+                    passed=passed,
+                    critical=True,
+                    evidence="quoted from the output",
+                    reason="synthetic",
+                )
+            ],
+            fix_instruction="" if passed else "fix it",
+            # Deliberately always "accept": the grader must follow the checks,
+            # never this field.
+            verdict="accept",
+        )
+
+    good = {
+        "fixture_id": "f-accept",
+        "expected_verdict": "accept",
+        "mutation_type": None,
+        "broken_criterion": None,
+    }
+    broken = {
+        "fixture_id": "f-revise",
+        "expected_verdict": "revise",
+        "mutation_type": "factual",
+        "broken_criterion": "c1",
+    }
+
+    # The truthful key: a Critic that passes good work and fails broken work.
+    check(
+        ec.grade_outcome(good, verdict(passed=True)).correct,
+        "truthful key: accept case scores correct",
+    )
+    check(
+        ec.grade_outcome(broken, verdict(passed=False)).correct,
+        "truthful key: revise case scores correct",
+    )
+
+    # The same verdicts against an inverted key must all be marked wrong.
+    flipped = ec.invert([good, broken])
+    check(
+        [f["expected_verdict"] for f in flipped] == ["revise", "accept"],
+        "invert() flips every expected verdict",
+    )
+    check(
+        [f["expected_verdict"] for f in [good, broken]] == ["accept", "revise"],
+        "invert() copies rather than mutating the fixtures it was given",
+    )
+    inverted_outcomes = [
+        ec.grade_outcome(flipped[0], verdict(passed=True)),
+        ec.grade_outcome(flipped[1], verdict(passed=False)),
+    ]
+    check(
+        not any(o.correct for o in inverted_outcomes),
+        "inverted key: the grader reports failure on every case",
+    )
+    check(
+        all(o.accepted is not None for o in inverted_outcomes),
+        "the verdict itself is unchanged -- only the expectation moved",
+    )
+
+    # A judge that rejects everything and one that accepts everything must not
+    # be able to score the same, which is the whole reason the two rates are
+    # reported separately.
+    always_accept = [
+        ec.grade_outcome(good, verdict(True)),
+        ec.grade_outcome(broken, verdict(True)),
+    ]
+    always_reject = [
+        ec.grade_outcome(good, verdict(False)),
+        ec.grade_outcome(broken, verdict(False)),
+    ]
+    check(
+        [o.correct for o in always_accept] == [True, False],
+        "a judge that accepts everything fails the revise case",
+    )
+    check(
+        [o.correct for o in always_reject] == [False, True],
+        "a judge that rejects everything fails the accept case",
+    )
+
+    # Naming the right criterion is tracked separately from the verdict.
+    caught = ec.grade_outcome(broken, verdict(passed=False))
+    check(
+        caught.caught_named_criterion is True,
+        "the named criterion is credited when it failed",
+    )
+    missed = ec.grade_outcome(
+        {**broken, "broken_criterion": "some other criterion"}, verdict(passed=False)
+    )
+    check(
+        missed.correct and missed.caught_named_criterion is False,
+        "rejecting for the wrong reason counts as a rejection but not as a catch",
+    )
+    check(
+        ec.grade_outcome(good, verdict(passed=True)).caught_named_criterion is None,
+        "a fixture that names no criterion is not scored on naming one",
+    )
+
+
+def check_fixture_file_integrity() -> None:
+    """The committed fixture file must never contain an inverted expectation.
+
+    The negative control inverts expectations in memory, for one function call.
+    If an inverted row ever reached the file on disk it would look identical to
+    a real fixture and would silently mark a correct Critic wrong for as long
+    as nobody noticed. These invariants are cheap; that failure is not.
+    """
+    print("\n[12] Fixture file integrity")
+    path = ROOT / "evals" / "critic_fixtures.jsonl"
+    if not path.exists():
+        check(True, "no fixture file yet -- nothing to verify")
+        return
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import make_fixtures as mf
+
+    text = path.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    check(bool(rows), "the fixture file has rows")
+    check(
+        all(r["expected_verdict"] in {"accept", "revise"} for r in rows),
+        "every expected_verdict is accept or revise",
+    )
+    check(all(r.get("reviewed") for r in rows), "every fixture is marked reviewed")
+    check(
+        len({r["fixture_id"] for r in rows}) == len(rows),
+        "fixture ids are unique",
+    )
+    check(
+        all(r["expected_verdict"] == "accept" for r in rows if r.get("mutation_type") == "benign"),
+        "every benign row expects accept -- a benign row expecting revise is an inverted row",
+    )
+    check(
+        all(
+            r["expected_verdict"] == "revise"
+            for r in rows
+            if r.get("mutation_type") and r["mutation_type"] not in mf.BENIGN_TYPES
+        ),
+        "every breaking mutation expects revise",
+    )
+    check(
+        all(r.get("broken_criterion") for r in rows if r["expected_verdict"] == "revise"),
+        "every revise row names the criterion it breaks",
+    )
+    check(
+        all(
+            r["broken_criterion"] in {c["text"] for c in r["acceptance_criteria"]}
+            for r in rows
+            if r["expected_verdict"] == "revise"
+        ),
+        "every named criterion exists in that fixture's criteria",
+    )
+    benign = [r for r in rows if r.get("mutation_type") == "benign"]
+    check(
+        all(not mf.machine_violations(r["output"], r["acceptance_criteria"]) for r in benign),
+        "every benign row still passes the machine check",
     )
 
 
@@ -723,6 +977,8 @@ def main() -> int:
     check_budget()
     check_controller_state_machine()
     check_fixture_builder()
+    check_critic_harness()
+    check_fixture_file_integrity()
     check_retry_policy()
     check_no_hardcoded_keys()
 

@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -50,9 +51,24 @@ from providers.retry_utils import ProviderError
 DEFAULT_RUNS = ROOT / "runs"
 DEFAULT_OUT = ROOT / "evals" / "critic_fixtures_draft.jsonl"
 
-# The five ways an output can be broken. Each isolates a different judging
-# skill, which is what makes a per-type pass rate worth reading.
-MUTATION_TYPES = ("quantitative", "language", "omission", "tone", "factual")
+# Every mutation type the generator understands. Not all of them break the
+# output: `benign` is a control, and it is the most informative row in the file
+# -- it is the only one that can catch a Critic rejecting work for looking
+# different rather than for failing anything.
+MUTATION_TYPES = ("quantitative", "language", "omission", "tone", "factual", "benign")
+
+# Mutations that leave every criterion satisfied. Their fixtures expect accept,
+# not revise.
+BENIGN_TYPES = ("benign",)
+
+# What the automatic rotation actually cycles through. `tone` is deliberately
+# absent: these criteria almost never constrain register, so a tone mutation
+# either breaks nothing (a fixture that would mark a correct Critic wrong) or
+# the model reaches for a subject change and breaks two criteria at once. Both
+# outcomes were observed on the first real batch and both were thrown away in
+# review. It stays available via --types for a task whose criteria do talk
+# about voice.
+ROTATION_TYPES = ("quantitative", "language", "omission", "factual", "benign")
 
 # Factual is the one that must always be present. It is the hardest for a judge
 # -- nothing about the shape of the text gives it away, only the content does --
@@ -76,7 +92,14 @@ tone      -- shift register or add the jargon/marketing voice a criterion
     forbids, without changing the facts.
 factual   -- keep the length, language, structure and tone identical and
     change a claim so it is wrong. Nothing about the shape of the text
-    should betray it; only the content is false."""
+    should betray it; only the content is false.
+benign    -- rewrite the surface and break NOTHING. Reorder clauses, swap
+    words for synonyms, resplit or rejoin phrasing -- but only where no
+    criterion constrains it, and re-check every criterion afterwards. If a
+    criterion fixes the sentence count, keep that exact count; if it requires
+    a word, keep that word; if it caps the length, stay under it. The result
+    must still satisfy every single criterion. This is a control case: it
+    tests whether the judge rejects work merely for looking different."""
 
 console = Console()
 
@@ -306,6 +329,130 @@ def _unwrap(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+# --- machine-checkable criteria --------------------------------------------
+#
+# A benign mutation is only useful if it really breaks nothing, and "the model
+# said it kept every criterion" is not evidence. These patterns cover the
+# criteria this system actually produces -- counts, required words, forbidden
+# phrases, language -- and are checked in code before a benign fixture is
+# allowed to claim expected_verdict: accept.
+#
+# Deliberately partial: a criterion this cannot parse is left alone rather than
+# guessed at. It fails closed in the direction that matters -- a violation it
+# can prove discards the fixture; a criterion it cannot read simply is not
+# vouched for.
+
+_MAX_WORDS = re.compile(
+    r"(?:fewer than|less than|under|at most|no more than|maximum of|up to)\s+(\d+)\s+words",
+    re.IGNORECASE,
+)
+# Counts are written both ways in practice -- "exactly 3 lines" and "exactly
+# three lines" -- and a pattern that reads only digits silently vouches for a
+# criterion it never checked.
+_COUNT = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+_EXACT_WORDS = re.compile(rf"exactly\s+{_COUNT}\s+words", re.IGNORECASE)
+_EXACT_LINES = re.compile(rf"exactly\s+{_COUNT}\s+(?:non-empty\s+)?lines", re.IGNORECASE)
+_EXACT_SENTENCES = re.compile(rf"exactly\s+{_COUNT}\s+sentences?", re.IGNORECASE)
+_CONTAINS_WORD = re.compile(
+    r"contains?\s+(?:the\s+)?(?:word|term|phrase)\s+[\"'“‘]?([\w' -]+?)[\"'”’]?\s*(?:\(|,|\.|$)",
+    re.IGNORECASE,
+)
+_ABSENT_PHRASE = re.compile(
+    r"(?:does not contain|must not contain|contains no|without)\s+(?:the\s+)?"
+    r"(?:word|term|phrase)\s+[\"'“‘]?([\w' -]+?)[\"'”’]?\s*(?:\(|,|\.|$)",
+    re.IGNORECASE,
+)
+_ENGLISH = re.compile(r"\b(?:in|written in)\s+English\b", re.IGNORECASE)
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _parse_count(token: str) -> int | None:
+    token = token.strip().lower()
+    if token.isdigit():
+        return int(token)
+    return _NUMBER_WORDS.get(token)
+# Latin-script languages give themselves away by function words far more
+# reliably than by diacritics, which English borrows freely.
+_NON_ENGLISH_MARKERS = re.compile(
+    r"\b(?:le|la|les|des|une|dans|avec|pour|ensuite|il|elle|est|sont"
+    r"|el|los|las|una|con|para|pero|puede|cuando|que|del"
+    r"|der|die|das|und|nicht|mit|auch)\b",
+    re.IGNORECASE,
+)
+
+
+def _count_sentences(text: str) -> int:
+    return len([part for part in re.split(r"[.!?]+(?:\s|$)", text.strip()) if part.strip()])
+
+
+def _looks_non_english(text: str) -> bool:
+    """True only when the evidence is unambiguous.
+
+    Non-Latin script is decisive. For Latin-script languages, one stray
+    borrowed word is not enough -- require several function words that English
+    does not use, so an English sentence containing "que" or "la" in a quote
+    does not trip it.
+    """
+    if re.search(r"[\u0600-\u06ff\u0400-\u04ff\u4e00-\u9fff\u3040-\u30ff]", text):
+        return True
+    return len(_NON_ENGLISH_MARKERS.findall(text)) >= 3
+
+
+def machine_violations(output: str, criteria: list[dict[str, Any]]) -> list[str]:
+    """Criteria this can check mechanically and finds violated.
+
+    Returns a human-readable reason per violation, so a discarded fixture says
+    why rather than just disappearing.
+    """
+    problems: list[str] = []
+    words = len(output.split())
+    lines = len([line for line in output.splitlines() if line.strip()])
+
+    for criterion in criteria:
+        text = criterion.get("text", "")
+        if not text:
+            continue
+
+        match = _MAX_WORDS.search(text)
+        if match and words >= int(match.group(1)):
+            problems.append(f"{words} words breaches '{text[:50]}'")
+
+        for pattern, actual, unit in (
+            (_EXACT_WORDS, words, "words"),
+            (_EXACT_LINES, lines, "lines"),
+            (_EXACT_SENTENCES, _count_sentences(output), "sentences"),
+        ):
+            match = pattern.search(text)
+            if not match:
+                continue
+            expected = _parse_count(match.group(1))
+            if expected is not None and actual != expected:
+                problems.append(f"{actual} {unit} is not exactly {expected}")
+
+        # Absence patterns first: "does not contain the word X" also matches
+        # the contains-pattern, and reading it as a requirement would invert it.
+        absent = _ABSENT_PHRASE.search(text)
+        if absent:
+            needle = absent.group(1).strip()
+            if needle and re.search(rf"\b{re.escape(needle)}\b", output, re.IGNORECASE):
+                problems.append(f"contains the forbidden {needle!r}")
+        else:
+            required = _CONTAINS_WORD.search(text)
+            if required:
+                needle = required.group(1).strip()
+                if needle and not re.search(rf"\b{re.escape(needle)}\b", output, re.IGNORECASE):
+                    problems.append(f"missing the required {needle!r}")
+
+        if _ENGLISH.search(text) and _looks_non_english(output):
+            problems.append("does not read as English")
+
+    return problems
+
+
 def _normalise_text(value: str) -> str:
     """Whitespace and trailing punctuation only -- never a fuzzy match.
 
@@ -324,6 +471,32 @@ def validate(mutation: Mutation, source: RunSource, stats: Stats) -> Mutation | 
     if mutation.mutation_type not in MUTATION_TYPES:
         stats.rejected.append(f"{source.run_id}: unknown type {mutation.mutation_type!r}")
         return None
+
+    if mutation.mutation_type in BENIGN_TYPES:
+        # A benign rewrite names no criterion: it is defined by breaking none.
+        # Anything the model echoed in broken_criterion is noise here.
+        mutation.broken_criterion = ""
+        body = mutation.mutated_output.strip()
+        if not body:
+            stats.rejected.append(f"{source.run_id}: empty benign output")
+            return None
+        if body == source.output.strip():
+            stats.rejected.append(f"{source.run_id}: benign output was unchanged")
+            return None
+
+        # The claim "this breaks nothing" is checked, not taken on trust. A
+        # benign fixture that quietly violates a criterion would teach the
+        # suite to punish a Critic for being right -- the most damaging kind of
+        # wrong row in the file, and the hardest to spot later.
+        violations = machine_violations(body, source.criteria)
+        if violations:
+            stats.rejected.append(
+                f"{source.run_id}: benign rewrite is not benign -- {'; '.join(violations)}"
+            )
+            return None
+
+        mutation.mutated_output = body
+        return mutation
 
     # The index is authoritative and the echoed text is a cross-check, not the
     # other way round. Asking a model to reproduce a sentence character for
@@ -378,7 +551,16 @@ def accept_row(source: RunSource, generator: str) -> dict[str, Any]:
     }
 
 
-def revise_row(source: RunSource, mutation: Mutation, index: int, generator: str) -> dict[str, Any]:
+def mutation_row(
+    source: RunSource, mutation: Mutation, index: int, generator: str
+) -> dict[str, Any]:
+    """A fixture row for one mutation.
+
+    The expected verdict follows from the type, not from the model's opinion:
+    a benign rewrite still satisfies every criterion, so the Critic is supposed
+    to accept it. Getting this backwards would train the suite to reward
+    exactly the behaviour it exists to catch.
+    """
     # The digest is what keeps ids unique across --append runs. Without it a
     # second batch reproduces "<run>::<type>::1" and the two rows become
     # indistinguishable downstream -- which silently cost a good fixture the
@@ -393,8 +575,8 @@ def revise_row(source: RunSource, mutation: Mutation, index: int, generator: str
         "acceptance_criteria": source.criteria,
         "criteria_format": source.criteria_format,
         "output": mutation.mutated_output,
-        "expected_verdict": "revise",
-        "broken_criterion": mutation.broken_criterion,
+        "expected_verdict": "accept" if mutation.mutation_type in BENIGN_TYPES else "revise",
+        "broken_criterion": mutation.broken_criterion or None,
         "mutation_type": mutation.mutation_type,
         "mutation_explanation": mutation.explanation,
         "generator_model": generator,
@@ -415,8 +597,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default=anthropic.DEFAULT_MODEL)
     parser.add_argument(
-        "--types", default=",".join(MUTATION_TYPES),
-        help=f"comma-separated subset of: {', '.join(MUTATION_TYPES)}",
+        "--types", default=None,
+        help=(
+            f"comma-separated subset of: {', '.join(MUTATION_TYPES)}. "
+            f"Defaults to the rotation ({', '.join(ROTATION_TYPES)}); 'tone' is "
+            "available but not rotated -- see ROTATION_TYPES."
+        ),
     )
     parser.add_argument("--exclude-evals", action="store_true", help="skip eval-suite runs")
     parser.add_argument(
@@ -428,16 +614,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="skip the spend confirmation")
     args = parser.parse_args(argv)
 
-    types = [t.strip() for t in args.types.split(",") if t.strip()]
+    # An explicit --types is an instruction, not a suggestion: the required-type
+    # guarantee below applies to the default rotation, not to a targeted top-up
+    # someone asked for by name.
+    explicit_types = args.types is not None
+    types = [t.strip() for t in (args.types or ",".join(ROTATION_TYPES)).split(",") if t.strip()]
     unknown = [t for t in types if t not in MUTATION_TYPES]
     if unknown:
         console.print(f"[red]unknown mutation type(s): {', '.join(unknown)}[/red]")
         return 2
     # The factual case is the one worth guaranteeing; see REQUIRED_TYPES.
-    for required in REQUIRED_TYPES:
-        if required not in types:
-            types.append(required)
-            console.print(f"[yellow]added the required '{required}' mutation type[/yellow]")
+    if not explicit_types:
+        for required in REQUIRED_TYPES:
+            if required not in types:
+                types.append(required)
+                console.print(f"[yellow]added the required '{required}' mutation type[/yellow]")
 
     sources = read_accepted_runs(args.runs, include_evals=not args.exclude_evals)
     stats = Stats(runs_seen=len(sources))
@@ -471,9 +662,13 @@ def main(argv: list[str] | None = None) -> int:
     for wanted in assignments.values():
         for mutation_type in wanted:
             spread[mutation_type] = spread.get(mutation_type, 0) + 1
+    benign_planned = sum(
+        1 for wanted in assignments.values() for t in wanted if t in BENIGN_TYPES
+    )
+    breaking_planned = len(selected) * args.per_run - benign_planned
     console.print(
         f"{len(selected)} run(s) × {args.per_run} mutation(s) = {len(selected)} Claude call(s), "
-        f"{len(selected)} accept + {len(selected) * args.per_run} revise rows"
+        f"{len(selected) + benign_planned} accept + {breaking_planned} revise rows"
     )
     console.print("planned spread: " + ", ".join(f"{k}×{v}" for k, v in spread.items()))
 
@@ -532,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             kept.append(checked)
 
         for index, mutation in enumerate(kept, start=1):
-            rows.append(revise_row(source, mutation, index, args.model))
+            rows.append(mutation_row(source, mutation, index, args.model))
             stats.mutation_rows += 1
             stats.by_type[mutation.mutation_type] = stats.by_type.get(mutation.mutation_type, 0) + 1
 
@@ -546,7 +741,7 @@ def main(argv: list[str] | None = None) -> int:
     # one mutation per run most runs are not even asked for them. Enforced in
     # code and not left to the prompt: a suite missing the hardest mutation
     # type reports a Critic that looks better than it is.
-    for required in REQUIRED_TYPES:
+    for required in REQUIRED_TYPES if not explicit_types else ():
         if stats.by_type.get(required) or budget.exceeded:
             continue
         for source in selected:
@@ -565,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             recovered = [m for m in (validate(m, source, stats) for m in retry) if m]
             if recovered:
                 mutation = recovered[0]
-                rows.append(revise_row(source, mutation, 99, args.model))
+                rows.append(mutation_row(source, mutation, 99, args.model))
                 stats.mutation_rows += 1
                 stats.by_type[required] = stats.by_type.get(required, 0) + 1
                 break
@@ -576,9 +771,11 @@ def main(argv: list[str] | None = None) -> int:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    benign_rows = sum(stats.by_type.get(t, 0) for t in BENIGN_TYPES)
     summary = Table(show_header=False, title="Draft fixtures")
-    summary.add_row("accept rows", str(stats.accept_rows))
-    summary.add_row("revise rows", str(stats.mutation_rows))
+    summary.add_row("accept rows (original)", str(stats.accept_rows))
+    summary.add_row("accept rows (benign)", str(benign_rows))
+    summary.add_row("revise rows", str(stats.mutation_rows - benign_rows))
     for mutation_type in MUTATION_TYPES:
         summary.add_row(f"  {mutation_type}", str(stats.by_type.get(mutation_type, 0)))
     summary.add_row("rejected", str(len(stats.rejected)))
