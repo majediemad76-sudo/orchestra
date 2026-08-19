@@ -12,9 +12,12 @@ cannot be quietly forgotten at a call site.
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Evidence quotes are for auditing, not for reproducing the output.
+EVIDENCE_MAX_CHARS = 200
 
 
 class Question(BaseModel):
@@ -45,7 +48,6 @@ class Task(BaseModel):
     context: str = Field(default="", description="Any extra context supplied by the user.")
     max_rounds: int = Field(default=4, ge=1, description="Hard cap on Manager/Worker/Critic rounds.")
     budget_usd: float = Field(default=0.50, gt=0, description="Dollar ceiling for the whole run.")
-    accept_score: int = Field(default=80, ge=0, le=100, description="Critic score needed to accept.")
 
 
 class ManagerPlan(BaseModel):
@@ -87,24 +89,113 @@ class WorkerOutput(BaseModel):
     ok: bool = Field(default=True, description="False when the worker failed to produce a result.")
 
 
+class CriterionCheck(BaseModel):
+    """One acceptance criterion, judged on its own.
+
+    A holistic 0-100 score asks the model to compress many judgements into one
+    number, and models anchor those numbers high. A single criterion answered
+    yes/no, with the quote that settles it, is a far more stable thing to ask
+    for -- and it is auditable afterwards, which a bare score never is.
+
+    ``evidence`` must be lifted from the output verbatim. Requiring a quote is
+    what stops the judgement from drifting into taste: a criterion the Critic
+    cannot point at is a criterion it did not really check.
+    """
+
+    criterion: str = Field(description="The criterion text, copied exactly as the Manager wrote it.")
+    passed: bool = Field(description="Whether the output satisfies this criterion.")
+    evidence: str = Field(
+        description=(
+            "A direct quote from the worker's output that settles this criterion, "
+            "at most 200 characters. Quote the absence-revealing part when it failed."
+        )
+    )
+    reason: str = Field(
+        description="Why that evidence shows the criterion was met or violated."
+    )
+
+    @field_validator("evidence")
+    @classmethod
+    def _cap_evidence(cls, value: str) -> str:
+        """Truncate rather than reject.
+
+        The 200-character cap keeps logs and the UI readable; it is not worth
+        failing a paid round over a quote that ran to 214 characters, which a
+        raising validator would do.
+        """
+        value = value.strip()
+        return value if len(value) <= EVIDENCE_MAX_CHARS else value[: EVIDENCE_MAX_CHARS - 1] + "…"
+
+
 class CriticVerdict(BaseModel):
-    """The Critic's grade against the acceptance criteria.
+    """The Critic's judgement: one binary check per acceptance criterion.
+
+    The model is never asked for a score. It answers a series of yes/no
+    questions and quotes its evidence; the number is arithmetic done here, in
+    code. That is the same rule the Controller follows -- judgement from the
+    model, decisions from Python -- applied one level down.
 
     ``fix_instruction`` is the field that actually moves the loop forward -- it
     is fed back to the Manager, so a diagnosis without a remedy costs a round.
 
-    ``verdict`` is advice, not control flow: ``escalate`` does not reach the
-    user by itself (see the three triggers in ``controller.py``); it counts as
-    a rejection and returns to the Manager, who may then ask for input.
+    ``verdict`` is advice, not control flow. Acceptance is decided by
+    ``all_passed``, not by the model saying "accept". The value that still
+    carries information is ``escalate``: the problem is with the task itself
+    rather than the output. It counts as a rejection and returns to the
+    Manager, who may then ask the user.
     """
 
-    score: int = Field(ge=0, le=100, description="0-100 score against the acceptance criteria.")
-    met_criteria: List[str] = Field(default_factory=list, description="Criteria that passed.")
-    failed_criteria: List[str] = Field(default_factory=list, description="Criteria that failed.")
+    checks: List[CriterionCheck] = Field(
+        default_factory=list,
+        description="One entry per acceptance criterion, in the order they were given.",
+    )
     fix_instruction: str = Field(
         default="", description="Actionable fix, not a description of the problem."
     )
     verdict: Literal["accept", "revise", "escalate"] = Field(description="What should happen next.")
+
+    @property
+    def all_passed(self) -> bool:
+        """The acceptance test. An empty check list fails, deliberately.
+
+        A Critic that returned no checks judged nothing, and "nothing was
+        judged" must not read as "everything passed".
+        """
+        return bool(self.checks) and all(check.passed for check in self.checks)
+
+    @property
+    def score(self) -> int:
+        """Share of criteria met, 0-100. Derived, never supplied by the model.
+
+        It exists for logs, dashboards and eval thresholds -- not for the
+        accept decision, which is binary.
+        """
+        if not self.checks:
+            return 0
+        return round(100 * sum(check.passed for check in self.checks) / len(self.checks))
+
+    @property
+    def met_criteria(self) -> List[str]:
+        return [check.criterion for check in self.checks if check.passed]
+
+    @property
+    def failed_criteria(self) -> List[str]:
+        return [check.criterion for check in self.checks if not check.passed]
+
+    def as_record(self) -> Dict[str, Any]:
+        """Serialisation for the run log: the raw checks plus what they imply.
+
+        The derived values are written out rather than left to be recomputed,
+        so a log line stands on its own years later without this class.
+        """
+        data = self.model_dump()
+        data.update(
+            score=self.score,
+            all_passed=self.all_passed,
+            met_criteria=self.met_criteria,
+            failed_criteria=self.failed_criteria,
+        )
+        return data
 
 
 class Escalation(BaseModel):

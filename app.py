@@ -413,12 +413,21 @@ def _normalise_stage(name: str, event: Dict[str, Any]) -> Dict[str, Any]:
             "model": event.get("model", "?"),
         }
     verdict = event.get("verdict") or {}
+    checks = verdict.get("checks") or []
+    # Logs written before the per-criterion schema carry only the two name
+    # lists. Rebuild what can be rebuilt so old runs still render.
+    met = verdict.get("met_criteria") or [c["criterion"] for c in checks if c.get("passed")]
+    failed = verdict.get("failed_criteria") or [
+        c["criterion"] for c in checks if not c.get("passed")
+    ]
     return {
         "round": event.get("round"),
         "score": verdict.get("score", 0),
+        "all_passed": verdict.get("all_passed", bool(checks) and not failed),
         "verdict": verdict.get("verdict", "?"),
-        "met_criteria": verdict.get("met_criteria") or [],
-        "failed_criteria": verdict.get("failed_criteria") or [],
+        "checks": checks,
+        "met_criteria": met,
+        "failed_criteria": failed,
         "fix_instruction": verdict.get("fix_instruction", ""),
     }
 
@@ -496,8 +505,13 @@ def _render_sidebar() -> Tuple[float, int]:
 def _round_headline(number: int, stages: Dict[str, Any]) -> str:
     critic = stages["critic"]
     if critic:
-        icon = VERDICT_ICONS.get(critic["verdict"], "•")
-        return f"{icon}  Round {number} · Score {critic['score']} · {critic['verdict']}"
+        checks = critic.get("checks") or []
+        met = len(critic.get("met_criteria") or [])
+        total = len(checks) or (met + len(critic.get("failed_criteria") or []))
+        passed_all = critic.get("all_passed", met == total and total > 0)
+        icon = "✅" if passed_all else VERDICT_ICONS.get(critic.get("verdict"), "🔁")
+        detail = f"{met}/{total} criteria" if total else "no criteria judged"
+        return f"{icon}  Round {number} · {detail} · {critic.get('score', 0)}%"
     if stages["worker"]:
         return f"⏳  Round {number} · reviewing"
     if stages["manager"]:
@@ -537,18 +551,34 @@ def _render_round(number: int, stages: Dict[str, Any], expanded: bool) -> None:
         st.divider()
         st.markdown("##### 🔍 Critic Verdict")
         if critic:
+            checks = critic.get("checks") or []
+            met = len(critic.get("met_criteria") or [])
+            total = len(checks) or (met + len(critic.get("failed_criteria") or []))
             left, right = st.columns([1, 3])
-            left.metric("Score", critic["score"])
-            with right:
-                if critic["failed_criteria"]:
-                    st.markdown("**Failed criteria**")
-                    for criterion in critic["failed_criteria"]:
-                        st.markdown(f"- ❌ {criterion}")
-                else:
-                    st.markdown("**Failed criteria** — none.")
-                if critic["met_criteria"]:
-                    st.caption(f"Met: {', '.join(critic['met_criteria'])}")
-            if critic["fix_instruction"]:
+            left.metric("Criteria Met", f"{met}/{total}" if total else "—")
+            right.caption(
+                "Every criterion is judged on its own; the percentage is arithmetic "
+                "over these checks, not a number the model chose."
+            )
+
+            if checks:
+                for item in checks:
+                    passed = item.get("passed")
+                    with st.container(border=True):
+                        st.markdown(f"{'✅' if passed else '❌'} **{item.get('criterion', '?')}**")
+                        evidence = (item.get("evidence") or "").strip()
+                        if evidence:
+                            st.markdown(f"> {evidence}")
+                        if item.get("reason"):
+                            st.caption(item["reason"])
+            else:
+                # Older logs, written before the per-criterion schema.
+                for criterion in critic.get("failed_criteria") or []:
+                    st.markdown(f"- ❌ {criterion}")
+                for criterion in critic.get("met_criteria") or []:
+                    st.markdown(f"- ✅ {criterion}")
+
+            if critic.get("fix_instruction"):
                 st.info(f"**Fix instruction** — {critic['fix_instruction']}")
         else:
             st.caption("Waiting…")

@@ -16,11 +16,11 @@ whatever is cheapest that week.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from providers import ProviderResult, google
 from providers.schema_utils import json_hint
-from schemas import CriticVerdict, ManagerPlan, WorkerOutput
+from schemas import CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
 
 from . import load_prompt
 
@@ -62,20 +62,28 @@ def review(plan: ManagerPlan, output: WorkerOutput) -> Tuple[CriticVerdict, Prov
     return CriticVerdict.model_validate(data), result
 
 
-def failed_worker_verdict(reason: str) -> CriticVerdict:
+def failed_worker_verdict(reason: str, criteria: Optional[List[str]] = None) -> CriticVerdict:
     """Synthesise a rejection for a Worker that produced nothing.
 
-    A timeout or a dead CLI is a fact about the round, not an error condition:
-    scoring it 0 lets it flow through the same path as a bad answer, so the
-    two-rejection rule counts it and the Manager gets told why.
+    A timeout or a dead CLI is a fact about the round, not an error condition.
+    Marking every criterion failed lets it flow through the same path as a bad
+    answer, so the two-rejection rule counts it and the Manager gets told why.
 
-    No Critic call is made -- there is nothing to grade, and the run should not
-    pay to be told so.
+    The evidence field is empty here and that is honest: there is no output to
+    quote. No Critic call is made either -- there is nothing to grade, and the
+    run should not pay to be told so.
     """
+    criteria = criteria or ["worker produced usable output"]
     return CriticVerdict(
-        score=0,
-        met_criteria=[],
-        failed_criteria=["worker produced no usable output"],
+        checks=[
+            CriterionCheck(
+                criterion=criterion,
+                passed=False,
+                evidence="",
+                reason=f"The worker produced no output to check. {reason}".strip(),
+            )
+            for criterion in criteria
+        ],
         fix_instruction=(
             "Break the task into smaller steps and make the instruction shorter and "
             f"more specific. The previous round failed because: {reason}"

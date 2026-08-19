@@ -107,6 +107,9 @@ def grade(spec: Dict[str, Any], summary: Dict[str, Any]) -> List[str]:
         if not summary["status"].startswith(expected_status):
             failures.append(f"status {summary['status']} != {expected_status}")
 
+    # Acceptance is binary now, so min_score is no longer a duplicate of the
+    # accept rule -- it measures *how much* of the criteria set held up, which
+    # is the interesting number when a task fails.
     min_score = spec.get("min_score")
     if min_score:
         score = summary.get("score")
@@ -134,7 +137,6 @@ def run_one(spec: Dict[str, Any], suite_id: str) -> TaskResult:
         context=spec.get("context", ""),
         max_rounds=spec.get("max_rounds", 3),
         budget_usd=spec.get("budget_usd", 0.15),
-        accept_score=spec.get("accept_score", 80),
     )
     started = time.time()
     try:

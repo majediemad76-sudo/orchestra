@@ -32,6 +32,7 @@ from providers.schema_utils import (  # noqa: E402
     to_xai_schema,
 )
 from schemas import (  # noqa: E402
+    CriterionCheck,
     CriticVerdict,
     Escalation,
     ManagerPlan,
@@ -86,8 +87,35 @@ def check_pydantic_models() -> None:
     )
     check(plan_with_optional.question is not None, "ManagerPlan builds with the optional field")
 
-    verdict = CriticVerdict(score=91, met_criteria=["a"], failed_criteria=[], fix_instruction="", verdict="accept")
-    check(verdict.score == 91, "CriticVerdict builds")
+    passing = CriterionCheck(criterion="a", passed=True, evidence="quoted", reason="because")
+    failing = CriterionCheck(criterion="b", passed=False, evidence="quoted", reason="because")
+    check(CriticVerdict(checks=[passing], verdict="accept").score == 100, "CriticVerdict builds")
+    check(
+        CriterionCheck(criterion="c", passed=True, evidence="x" * 300, reason="r").evidence.__len__() == 200,
+        "CriterionCheck truncates evidence instead of rejecting it",
+    )
+
+    # The score is arithmetic, not a model output -- these are the rules the
+    # accept decision now rests on.
+    check(CriticVerdict(checks=[passing, failing], verdict="accept").score == 50, "score is the pass ratio")
+    check(
+        CriticVerdict(checks=[passing, passing, failing], verdict="revise").score == 67,
+        "score rounds to the nearest whole percent",
+    )
+    check(CriticVerdict(checks=[passing, failing], verdict="accept").all_passed is False,
+          "one failed criterion means not accepted, whatever the model said")
+    check(CriticVerdict(checks=[passing, passing], verdict="revise").all_passed is True,
+          "all criteria passing means accepted, whatever the model said")
+    check(CriticVerdict(checks=[], verdict="accept").all_passed is False,
+          "an empty check list fails closed")
+    check(CriticVerdict(checks=[], verdict="accept").score == 0, "no checks scores 0, not 100")
+    mixed = CriticVerdict(checks=[passing, failing], verdict="revise")
+    check(mixed.met_criteria == ["a"] and mixed.failed_criteria == ["b"], "met/failed derive from checks")
+    record = mixed.as_record()
+    check(
+        {"checks", "score", "all_passed", "met_criteria", "failed_criteria"} <= set(record),
+        "as_record writes the derived values into the log",
+    )
     check(WorkerOutput(result="x").ok is True, "WorkerOutput builds")
     check(Task(goal="g").max_rounds == 4, "Task builds with defaults")
     check(
@@ -116,6 +144,11 @@ def check_anthropic() -> None:
         check("$ref" not in blob, f"{model.__name__}: no $ref left")
         check("$defs" not in blob, f"{model.__name__}: no $defs left")
         check(schema.get("type") == "object", f"{model.__name__}: top level is an object")
+    verdict_schema = to_anthropic_schema(CriticVerdict)
+    check(
+        "criterion" in json.dumps(verdict_schema["properties"]["checks"]),
+        "CriticVerdict.checks inlines CriterionCheck",
+    )
     nested = to_anthropic_schema(ManagerPlan)["properties"]["question"]
     check(
         "properties" in json.dumps(nested),
@@ -144,6 +177,12 @@ def check_xai() -> None:
     question = schema["properties"]["question"]
     check("null" in json.dumps(question["type"]), "optional field is typed nullable, not omitted")
 
+    nested = to_xai_schema(CriticVerdict)["json_schema"]["schema"]["properties"]["checks"]["items"]
+    check(nested.get("additionalProperties") is False,
+          "objects inside an array also get additionalProperties: false")
+    check(set(nested.get("required", [])) == set(nested.get("properties", {})),
+          "objects inside an array also list every property in required")
+
 
 def check_gemini() -> None:
     print("\n[4] Gemini converter (responseSchema)")
@@ -163,9 +202,19 @@ def check_gemini() -> None:
     check("nullable" not in schema["properties"]["plan"], "required field is not nullable")
     check(schema["properties"]["worker_type"]["enum"] == ["text", "code"], "Literal maps to enum")
 
-    verdict = to_gemini_schema(CriticVerdict)
-    check(verdict["properties"]["score"]["type"] == "INTEGER", "int maps to INTEGER")
+    check(to_gemini_schema(Task)["properties"]["max_rounds"]["type"] == "INTEGER", "int maps to INTEGER")
     check(to_gemini_schema(WorkerOutput)["properties"]["ok"]["type"] == "BOOLEAN", "bool maps to BOOLEAN")
+
+    # CriticVerdict is the only schema with a list of nested models, which is
+    # the shape most likely to break a dialect conversion.
+    verdict = to_gemini_schema(CriticVerdict)
+    checks = verdict["properties"]["checks"]
+    check(checks["type"] == "ARRAY" and checks["items"]["type"] == "OBJECT",
+          "list of nested models maps to ARRAY of OBJECT")
+    check(checks["items"]["properties"]["passed"]["type"] == "BOOLEAN",
+          "nested bool maps to BOOLEAN")
+    check("score" not in verdict["properties"],
+          "the derived score is never asked of the model")
 
 
 def check_ref_resolution() -> None:
@@ -241,16 +290,23 @@ def check_controller_state_machine() -> None:
             output_tokens=100,
         )
 
-    def make_critic(score: int):
+    def make_critic(passes: bool):
         def fake_review(plan, output):
             calls["critic"] += 1
             return (
                 CriticVerdict(
-                    score=score,
-                    met_criteria=["c1"] if score >= 80 else [],
-                    failed_criteria=[] if score >= 80 else ["c1"],
-                    fix_instruction="" if score >= 80 else "shorten it",
-                    verdict="accept" if score >= 80 else "revise",
+                    checks=[
+                        CriterionCheck(
+                            criterion="c1",
+                            passed=passes,
+                            evidence="fake result",
+                            reason="because this is a fake",
+                        )
+                    ],
+                    fix_instruction="" if passes else "shorten it",
+                    # Deliberately contradicts the checks: the Controller must
+                    # follow the checks, not this field.
+                    verdict="accept",
                 ),
                 ProviderResult(data={}, model="gemini-3.1-flash-lite", input_tokens=100, output_tokens=100),
             )
@@ -261,9 +317,9 @@ def check_controller_state_machine() -> None:
         # Baseline: a good score ends the run immediately.
         controller.manager_role.plan = fake_plan
         controller.worker_role.execute = fake_worker
-        controller.critic_role.review = make_critic(95)
+        controller.critic_role.review = make_critic(True)
         summary = controller.run_task(Task(goal="g"), ask=_fake_ask(0), run_id="selfcheck-accept")
-        check(summary["status"] == "accepted", "accepts on a high score")
+        check(summary["status"] == "accepted", "accepts when every criterion passes")
         check(summary["rounds"] == 1, "stops as soon as it is accepted")
         check(summary["budget"]["spent_usd"] > 0, "cost is accumulated")
         lines = [json.loads(l) for l in (tmp / "selfcheck-accept.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -276,7 +332,7 @@ def check_controller_state_machine() -> None:
         # Trigger 1. The escalation must fire on the second rejection --
         # firing later means budget was spent that the rule exists to save.
         calls.update({"manager": 0, "worker": 0, "critic": 0})
-        controller.critic_role.review = make_critic(40)
+        controller.critic_role.review = make_critic(False)
         summary = controller.run_task(
             Task(goal="g", max_rounds=6), ask=_fake_ask(2), run_id="selfcheck-reject"
         )
@@ -290,7 +346,7 @@ def check_controller_state_machine() -> None:
         # Trigger 2. The answer must reach the Manager, and the round must not
         # be counted against the cap.
         calls.update({"manager": 0, "worker": 0, "critic": 0})
-        controller.critic_role.review = make_critic(95)
+        controller.critic_role.review = make_critic(True)
         summary = controller.run_task(
             Task(goal="g", context="ask"), ask=_fake_ask(1), run_id="selfcheck-ask"
         )
@@ -304,7 +360,7 @@ def check_controller_state_machine() -> None:
         # Trigger 3. A ceiling too small for two rounds is crossed by round 2,
         # where the top-of-loop check catches it before spending more.
         calls.update({"manager": 0, "worker": 0, "critic": 0})
-        controller.critic_role.review = make_critic(40)
+        controller.critic_role.review = make_critic(False)
         summary = controller.run_task(
             Task(goal="g", budget_usd=0.0005, max_rounds=6), ask=_fake_ask(2), run_id="selfcheck-budget"
         )

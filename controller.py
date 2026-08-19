@@ -18,6 +18,10 @@ timeout counts as a rejection. Hitting the round cap ends the run with a
 report. This is a deliberate narrowing: an orchestrator that asks whenever it
 is unsure is an orchestrator nobody leaves running.
 
+A round is accepted when every acceptance criterion passes its own binary
+check -- see ``schemas.CriticVerdict.all_passed``. There is no score threshold
+to tune, and the model's own "accept" does not decide anything.
+
 Every escalation is one question with 2-4 concrete options. See
 ``schemas.Question`` for why.
 
@@ -437,11 +441,13 @@ def run_task(
         if not run.output.ok:
             # No output to grade: synthesise the rejection instead of paying
             # the Critic to state the obvious.
-            verdict = critic_role.failed_worker_verdict(run.failure_reason or "worker failed")
+            verdict = critic_role.failed_worker_verdict(
+                run.failure_reason or "worker failed", plan.acceptance_criteria
+            )
             log.write(
                 "critic_verdict",
                 round=state.round,
-                verdict=verdict.model_dump(),
+                verdict=verdict.as_record(),
                 cost_usd=0.0,
                 cost_basis=API_BILLED,
                 synthetic=True,
@@ -457,17 +463,23 @@ def run_task(
             log.write(
                 "critic_verdict",
                 round=state.round,
-                verdict=verdict.model_dump(),
+                verdict=verdict.as_record(),
                 cost_usd=entry.cost_usd,
                 cost_basis=API_BILLED,
                 model=entry.model,
             )
         state.verdict = verdict
+        lines = [
+            f"{'✓' if check.passed else '✗'} {check.criterion}" for check in verdict.checks
+        ] or ["(the Critic returned no checks)"]
+        if verdict.fix_instruction:
+            lines += ["", verdict.fix_instruction]
         console.print(
             Panel(
-                f"score={verdict.score}  verdict={verdict.verdict}\n{verdict.fix_instruction}",
-                title="Critic verdict",
-                border_style="magenta" if verdict.verdict != "accept" else "green",
+                "\n".join(lines),
+                title=f"Critic verdict — {verdict.score}% ({len(verdict.met_criteria)}"
+                f"/{len(verdict.checks)} criteria)",
+                border_style="green" if verdict.all_passed else "magenta",
             )
         )
         emit(
@@ -475,7 +487,9 @@ def run_task(
             {
                 "round": state.round,
                 "score": verdict.score,
+                "all_passed": verdict.all_passed,
                 "verdict": verdict.verdict,
+                "checks": [check.model_dump() for check in verdict.checks],
                 "met_criteria": list(verdict.met_criteria),
                 "failed_criteria": list(verdict.failed_criteria),
                 "fix_instruction": verdict.fix_instruction,
@@ -486,7 +500,10 @@ def run_task(
         if verdict.score > state.best_score:
             state.best_score, state.best_result = verdict.score, run.output.result
 
-        accepted = verdict.verdict == "accept" and verdict.score >= task.accept_score
+        # The one line that decides a round. Not the model's "accept" -- every
+        # criterion the Manager wrote has to pass on its own. A criterion the
+        # Critic could not judge (an empty check list) fails closed.
+        accepted = verdict.all_passed
         if accepted:
             state.consecutive_rejections = 0
             status = "accepted"
@@ -558,7 +575,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--context", default="", help="extra context for the manager")
     parser.add_argument("--max-rounds", type=int, default=4)
     parser.add_argument("--budget", type=float, default=1.0, help="dollar ceiling for the run")
-    parser.add_argument("--accept-score", type=int, default=80)
     parser.add_argument("--cwd", default=None, help="working directory for the code worker")
     args = parser.parse_args(argv)
 
@@ -567,7 +583,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         context=args.context,
         max_rounds=args.max_rounds,
         budget_usd=args.budget,
-        accept_score=args.accept_score,
     )
     summary = run_task(task, cwd=args.cwd)
     print_summary(summary)
