@@ -21,7 +21,7 @@ import json
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_TURNS = 15
@@ -43,7 +43,7 @@ class CodeResult:
     num_turns: int = 0
     error: str = ""
     timed_out: bool = False
-    raw: Dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 def available() -> bool:
@@ -55,10 +55,10 @@ def available() -> bool:
 
 def run(
     prompt: str,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout: int = DEFAULT_TIMEOUT,
-    allowed_tools: Optional[List[str]] = None,
+    allowed_tools: list[str] | None = None,
 ) -> CodeResult:
     """Run one headless session and parse its JSON envelope.
 

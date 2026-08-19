@@ -40,7 +40,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -82,8 +82,12 @@ STATUS_LABELS = {
     "accepted_by_user": ("✅", "Accepted by you", "You chose to keep the best output so far."),
     "stopped_by_user": ("⏹️", "Stopped by you", "You ended the run at an escalation."),
     "stopped_by_flag": ("⏹️", "Stopped", "Cancelled with the Stop button."),
-    "escalated_unanswered": ("⚠️", "Escalation unanswered", "The loop asked a question nobody answered."),
-    "max_rounds": ("⚠️", "Round limit reached", "The output was never accepted within the round cap."),
+    "escalated_unanswered": (
+        "⚠️", "Escalation unanswered", "The loop asked a question nobody answered."
+    ),
+    "max_rounds": (
+        "⚠️", "Round limit reached", "The output was never accepted within the round cap."
+    ),
 }
 
 VERDICT_ICONS = {"accept": "✅", "revise": "🔁", "escalate": "⚠️"}
@@ -101,8 +105,8 @@ class EscalationTimeout(RuntimeError):
 
 def _run_in_background(
     task: Task,
-    outbox: "queue.Queue[Tuple[str, Dict[str, Any]]]",
-    answers: "queue.Queue[str]",
+    outbox: queue.Queue[tuple[str, dict[str, Any]]],
+    answers: queue.Queue[str],
     stop_flag: threading.Event,
 ) -> None:
     """Body of the worker thread. Speaks only through the two queues.
@@ -112,7 +116,7 @@ def _run_in_background(
     can never be left waiting on a thread that has already died.
     """
 
-    def on_progress(event: str, data: Dict[str, Any]) -> None:
+    def on_progress(event: str, data: dict[str, Any]) -> None:
         outbox.put((event, data))
 
     def on_escalation(question: Question) -> str:
@@ -145,7 +149,7 @@ def _run_in_background(
         outbox.put((FINISHED, summary))
     except EscalationTimeout as exc:
         outbox.put((FAILED, {"error": str(exc), "timeout": True}))
-    except Exception as exc:  # noqa: BLE001 -- the thread must report, not vanish
+    except Exception as exc:
         outbox.put((FAILED, {"error": f"{type(exc).__name__}: {exc}"}))
 
 
@@ -153,7 +157,7 @@ def _run_in_background(
 
 
 def _init_state() -> None:
-    defaults: Dict[str, Any] = {
+    defaults: dict[str, Any] = {
         "queue": None,
         "answers": None,
         "stop_flag": None,
@@ -208,13 +212,17 @@ def _drain_queue() -> None:
     # leave the page polling forever. A thread parked on the answer queue is
     # alive, so this cannot misfire during an escalation.
     thread = st.session_state["thread"]
-    if st.session_state["running"] and thread is not None and not thread.is_alive():
-        if outbox.empty():
-            st.session_state["running"] = False
-            st.session_state["pending_question"] = None
+    if (
+        st.session_state["running"]
+        and thread is not None
+        and not thread.is_alive()
+        and outbox.empty()
+    ):
+        st.session_state["running"] = False
+        st.session_state["pending_question"] = None
 
 
-def _record_round_event(event: str, data: Dict[str, Any]) -> None:
+def _record_round_event(event: str, data: dict[str, Any]) -> None:
     """Group stage events by round for rendering."""
     round_no = data.get("round")
     if round_no is None:
@@ -238,8 +246,8 @@ def _record_round_event(event: str, data: Dict[str, Any]) -> None:
 
 
 def _start_run(goal: str, budget: float, max_rounds: int) -> None:
-    outbox: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
-    answers: "queue.Queue[str]" = queue.Queue()
+    outbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+    answers: queue.Queue[str] = queue.Queue()
     stop_flag = threading.Event()
     task = Task(goal=goal, budget_usd=budget, max_rounds=max_rounds)
     thread = threading.Thread(
@@ -294,7 +302,7 @@ def _request_stop() -> None:
 
 
 @st.cache_data(show_spinner=False)
-def _parse_run_log(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
+def _parse_run_log(path_str: str, mtime: float, size: int) -> dict[str, Any]:
     """Turn one JSONL run log into a render-ready record.
 
     Cached on (path, mtime, size): during a live run this page re-renders every
@@ -307,7 +315,7 @@ def _parse_run_log(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
     skipped, and a log that yields nothing still returns a record rather than
     raising -- one bad file must not take down the History tab.
     """
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "path": path_str,
         "run_id": Path(path_str).stem,
         "timestamp": "",
@@ -382,7 +390,7 @@ def _parse_run_log(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
 _STAGE_KEYS = {"manager_plan": "manager", "worker_output": "worker", "critic_verdict": "critic"}
 
 
-def _normalise_stage(name: str, event: Dict[str, Any]) -> Dict[str, Any]:
+def _normalise_stage(name: str, event: dict[str, Any]) -> dict[str, Any]:
     """Map a log record onto the shape the live renderer already expects.
 
     The log and the progress hook carry the same facts in different shapes --
@@ -435,7 +443,7 @@ def _normalise_stage(name: str, event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_runs(directory: Path = RUNS_DIR) -> List[Dict[str, Any]]:
+def _load_runs(directory: Path = RUNS_DIR) -> list[dict[str, Any]]:
     """Newest first. A directory that does not exist is simply empty."""
     try:
         paths = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -461,7 +469,7 @@ def _short_timestamp(iso: str) -> str:
 # --- rendering -------------------------------------------------------------
 
 
-def _render_sidebar() -> Tuple[float, int]:
+def _render_sidebar() -> tuple[float, int]:
     with st.sidebar:
         st.header("⚙️ Run Settings")
         budget = st.slider(
@@ -505,7 +513,7 @@ def _render_sidebar() -> Tuple[float, int]:
     return budget, max_rounds
 
 
-def _round_headline(number: int, stages: Dict[str, Any]) -> str:
+def _round_headline(number: int, stages: dict[str, Any]) -> str:
     critic = stages["critic"]
     if critic:
         checks = critic.get("checks") or []
@@ -524,7 +532,7 @@ def _round_headline(number: int, stages: Dict[str, Any]) -> str:
     return f"⏳  Round {number} · planning"
 
 
-def _render_round(number: int, stages: Dict[str, Any], expanded: bool) -> None:
+def _render_round(number: int, stages: dict[str, Any], expanded: bool) -> None:
     manager, worker, critic = stages["manager"], stages["worker"], stages["critic"]
 
     with st.expander(_round_headline(number, stages), expanded=expanded):
@@ -698,7 +706,9 @@ def _render_history() -> None:
         [
             {
                 "Timestamp": _short_timestamp(record["timestamp"]),
-                "Task Goal": (record["goal"][:60] + "…") if len(record["goal"]) > 60 else record["goal"],
+                "Task Goal": (record["goal"][:60] + "…")
+                if len(record["goal"]) > 60
+                else record["goal"],
                 "Rounds Used": record["rounds"],
                 # Every cell in a column must share a type: Arrow rejects a
                 # column of ints with one "—" in it, and the table silently
@@ -731,7 +741,10 @@ def _render_history() -> None:
             if record["goal"]:
                 st.markdown(f"**Task Goal** — {record['goal']}")
             if record["escalations"]:
-                st.markdown("**Escalations** — " + ", ".join(f"`{e}`" for e in record["escalations"]))
+                st.markdown(
+                    "**Escalations** — "
+                    + ", ".join(f"`{e}`" for e in record["escalations"])
+                )
 
             details = record["round_details"]
             if details:

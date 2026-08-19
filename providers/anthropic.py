@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Type
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -50,7 +50,7 @@ def _api_key() -> str:
 
 @with_retry
 def call_structured(
-    schema_model: Type[BaseModel],
+    schema_model: type[BaseModel],
     system: str,
     user: str,
     model: str = DEFAULT_MODEL,
@@ -59,7 +59,7 @@ def call_structured(
 ) -> ProviderResult:
     """One Messages call whose only legal reply is a ``schema_model`` object."""
     tool = anthropic_tool(schema_model, name=TOOL_NAME)
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": system,
@@ -90,8 +90,8 @@ def call_structured(
     )
 
 
-def _extract_tool_input(body: Dict[str, Any]) -> Dict[str, Any]:
-    blocks: List[Dict[str, Any]] = body.get("content", []) or []
+def _extract_tool_input(body: dict[str, Any]) -> dict[str, Any]:
+    blocks: list[dict[str, Any]] = body.get("content", []) or []
     for block in blocks:
         if block.get("type") == "tool_use" and block.get("name") == TOOL_NAME:
             return block.get("input", {})
@@ -106,7 +106,7 @@ def _extract_tool_input(body: Dict[str, Any]) -> Dict[str, Any]:
     raise ProviderError("anthropic", f"no {TOOL_NAME} tool call in response: {str(body)[:400]}")
 
 
-def _loads_or_none(text: str) -> Optional[Dict[str, Any]]:
+def _loads_or_none(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]

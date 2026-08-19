@@ -7,7 +7,7 @@ retry a call without knowing which vendor produced it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any
 
 
 @dataclass
@@ -24,8 +24,8 @@ class ProviderResult:
     surprising, the normalised view is exactly the wrong thing to have kept.
     """
 
-    data: Dict[str, Any]
+    data: dict[str, Any]
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
-    raw: Dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)

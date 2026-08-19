@@ -29,22 +29,23 @@ import hashlib
 import json
 import os
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
-from pydantic import BaseModel, Field, ValidationError  # noqa: E402
-from rich.console import Console  # noqa: E402
-from rich.table import Table  # noqa: E402
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, ValidationError
+from rich.console import Console
+from rich.table import Table
 
-from budget import BudgetGuard  # noqa: E402
-from providers import anthropic  # noqa: E402
-from providers.retry_utils import ProviderError  # noqa: E402
+from budget import BudgetGuard
+from providers import anthropic
+from providers.retry_utils import ProviderError
 
 DEFAULT_RUNS = ROOT / "runs"
 DEFAULT_OUT = ROOT / "evals" / "critic_fixtures_draft.jsonl"
@@ -101,7 +102,7 @@ class Mutation(BaseModel):
 
 
 class MutationSet(BaseModel):
-    mutations: List[Mutation] = Field(default_factory=list)
+    mutations: list[Mutation] = Field(default_factory=list)
 
 
 @dataclass
@@ -112,7 +113,7 @@ class RunSource:
     path: str
     goal: str
     worker_prompt: str
-    criteria: List[Dict[str, Any]]
+    criteria: list[dict[str, Any]]
     output: str
     criteria_format: str
     bad_lines: int = 0
@@ -124,14 +125,14 @@ class Stats:
     runs_used: int = 0
     accept_rows: int = 0
     mutation_rows: int = 0
-    rejected: List[str] = field(default_factory=list)
-    by_type: Dict[str, int] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)
+    by_type: dict[str, int] = field(default_factory=dict)
 
 
 # --- reading the run logs --------------------------------------------------
 
 
-def _normalise_criteria(raw: Any) -> tuple[List[Dict[str, Any]], str]:
+def _normalise_criteria(raw: Any) -> tuple[list[dict[str, Any]], str]:
     """Accept both criteria shapes this project has used.
 
     Runs recorded before criteria became objects hold plain strings. They are
@@ -150,14 +151,14 @@ def _normalise_criteria(raw: Any) -> tuple[List[Dict[str, Any]], str]:
     )
 
 
-def read_accepted_runs(directory: Path, include_evals: bool) -> List[RunSource]:
+def read_accepted_runs(directory: Path, include_evals: bool) -> list[RunSource]:
     """Every run the Critic accepted, newest first.
 
     Only ``accepted`` counts -- not ``accepted_by_user``. A run the user waved
     through is precisely a case where the criteria were *not* all met, so it
     cannot serve as an example of an output that should be accepted.
     """
-    sources: List[RunSource] = []
+    sources: list[RunSource] = []
     for path in sorted(directory.glob("*.jsonl"), reverse=True):
         if not include_evals and path.stem.startswith("eval-"):
             continue
@@ -240,7 +241,7 @@ def request_mutations(
     types: Iterable[str],
     model: str,
     max_tokens: int,
-) -> tuple[List[Mutation], List[str], int, int]:
+) -> tuple[list[Mutation], list[str], int, int]:
     """One structured call to Claude.
 
     Returns (mutations, per-item problems, input tokens, output tokens). Items
@@ -273,8 +274,8 @@ def request_mutations(
     if not isinstance(raw_items, list):
         raise ValueError(f"no mutations list in the reply ({type(raw_items).__name__})")
 
-    mutations: List[Mutation] = []
-    problems: List[str] = []
+    mutations: list[Mutation] = []
+    problems: list[str] = []
     for position, raw in enumerate(raw_items, start=1):
         try:
             mutations.append(Mutation.model_validate(raw))
@@ -284,7 +285,7 @@ def request_mutations(
     return mutations, problems, result.input_tokens, result.output_tokens
 
 
-def _unwrap(data: Dict[str, Any]) -> Dict[str, Any]:
+def _unwrap(data: dict[str, Any]) -> dict[str, Any]:
     """Recover a payload whose list arrived as a JSON string.
 
     Even under a forced tool call, a model occasionally serialises a nested
@@ -314,7 +315,7 @@ def _normalise_text(value: str) -> str:
     return " ".join(value.split()).strip().rstrip(".").casefold()
 
 
-def validate(mutation: Mutation, source: RunSource, stats: Stats) -> Optional[Mutation]:
+def validate(mutation: Mutation, source: RunSource, stats: Stats) -> Mutation | None:
     """Drop anything that cannot serve as ground truth.
 
     Fail closed: a fixture that is wrong is worse than a fixture that is
@@ -357,7 +358,7 @@ def validate(mutation: Mutation, source: RunSource, stats: Stats) -> Optional[Mu
 # --- fixture rows ----------------------------------------------------------
 
 
-def accept_row(source: RunSource, generator: str) -> Dict[str, Any]:
+def accept_row(source: RunSource, generator: str) -> dict[str, Any]:
     return {
         "fixture_id": f"{source.run_id}::accept",
         "source_run": source.run_id,
@@ -372,12 +373,12 @@ def accept_row(source: RunSource, generator: str) -> Dict[str, Any]:
         "mutation_type": None,
         "mutation_explanation": None,
         "generator_model": None,  # this row is real, not generated
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "reviewed": False,
     }
 
 
-def revise_row(source: RunSource, mutation: Mutation, index: int, generator: str) -> Dict[str, Any]:
+def revise_row(source: RunSource, mutation: Mutation, index: int, generator: str) -> dict[str, Any]:
     # The digest is what keeps ids unique across --append runs. Without it a
     # second batch reproduces "<run>::<type>::1" and the two rows become
     # indistinguishable downstream -- which silently cost a good fixture the
@@ -397,27 +398,33 @@ def revise_row(source: RunSource, mutation: Mutation, index: int, generator: str
         "mutation_type": mutation.mutation_type,
         "mutation_explanation": mutation.explanation,
         "generator_model": generator,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "reviewed": False,
     }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="Build draft critic fixtures from accepted runs")
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--limit", type=int, default=10, help="how many accepted runs to mine")
     parser.add_argument("--per-run", type=int, default=1, help="mutations to request per run")
-    parser.add_argument("--budget", type=float, default=1.00, help="dollar ceiling for the whole job")
+    parser.add_argument(
+        "--budget", type=float, default=1.00, help="dollar ceiling for the whole job"
+    )
     parser.add_argument("--model", default=anthropic.DEFAULT_MODEL)
     parser.add_argument(
         "--types", default=",".join(MUTATION_TYPES),
         help=f"comma-separated subset of: {', '.join(MUTATION_TYPES)}",
     )
     parser.add_argument("--exclude-evals", action="store_true", help="skip eval-suite runs")
-    parser.add_argument("--append", action="store_true", help="add to the draft file instead of replacing it")
-    parser.add_argument("--dry-run", action="store_true", help="show what would be mined; no API calls")
+    parser.add_argument(
+        "--append", action="store_true", help="add to the draft instead of replacing it"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="show what would be mined; no API calls"
+    )
     parser.add_argument("--yes", action="store_true", help="skip the spend confirmation")
     args = parser.parse_args(argv)
 
@@ -460,7 +467,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ]
         for index, source in enumerate(selected)
     }
-    spread: Dict[str, int] = {}
+    spread: dict[str, int] = {}
     for wanted in assignments.values():
         for mutation_type in wanted:
             spread[mutation_type] = spread.get(mutation_type, 0) + 1
@@ -481,16 +488,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not sys.stdin.isatty():
             console.print("[red]not a tty; re-run with --yes to authorise the spend[/red]")
             return 2
-        if input(f"proceed, ceiling ${args.budget:.2f}? [y/N] ").strip().lower() not in {"y", "yes"}:
+        answer = input(f"proceed, ceiling ${args.budget:.2f}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
             console.print("aborted")
             return 1
 
     budget = BudgetGuard(limit_usd=args.budget)
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for source in selected:
         if budget.exceeded:
-            console.print(f"[yellow]budget ceiling reached; stopping before {source.run_id}[/yellow]")
+            console.print(
+                f"[yellow]budget ceiling reached; stopping before {source.run_id}[/yellow]"
+            )
             break
         console.rule(source.run_id[:60])
         rows.append(accept_row(source, args.model))
@@ -509,7 +519,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         entry = budget.charge(f"{source.run_id}.mutate", args.model, tin, tout)
         stats.rejected.extend(f"{source.run_id}: {note}" for note in problems)
 
-        kept: List[Mutation] = []
+        kept: list[Mutation] = []
         seen_outputs = {source.output.strip()}
         for mutation in mutations:
             checked = validate(mutation, source, stats)
@@ -540,7 +550,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if stats.by_type.get(required) or budget.exceeded:
             continue
         for source in selected:
-            console.print(f"[yellow]no {required} mutation yet; asking {source.run_id[:40]}[/yellow]")
+            console.print(
+                f"[yellow]no {required} mutation yet; asking {source.run_id[:40]}[/yellow]"
+            )
             try:
                 retry, problems, tin, tout = request_mutations(
                     source, [required], args.model, max_tokens=4000

@@ -14,7 +14,6 @@ through, hence the either/or below.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from providers import anthropic, claude_code
 from schemas import ManagerPlan, WorkerOutput
@@ -42,11 +41,11 @@ class WorkerRun:
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_usd: Optional[float] = None  # dollars when the backend reports them
+    cost_usd: float | None = None  # dollars when the backend reports them
     failure_reason: str = ""
 
 
-def execute(plan: ManagerPlan, cwd: Optional[str] = None) -> WorkerRun:
+def execute(plan: ManagerPlan, cwd: str | None = None) -> WorkerRun:
     if plan.worker_type == "code":
         return _execute_code(plan, cwd=cwd)
     return _execute_text(plan)
@@ -64,7 +63,7 @@ def _execute_text(plan: ManagerPlan) -> WorkerRun:
     )
 
 
-def _execute_code(plan: ManagerPlan, cwd: Optional[str] = None) -> WorkerRun:
+def _execute_code(plan: ManagerPlan, cwd: str | None = None) -> WorkerRun:
     run = claude_code.run(plan.worker_prompt, cwd=cwd)
     reason = run.error if not run.ok else ""
     return WorkerRun(

@@ -21,7 +21,7 @@ in every path here.
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Tuple, Type
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -77,7 +77,7 @@ _CONSTRAINT_KEYS = (
 _MAX_REF_DEPTH = 20
 
 
-def _lookup(root: Dict[str, Any], pointer: str) -> Dict[str, Any]:
+def _lookup(root: dict[str, Any], pointer: str) -> dict[str, Any]:
     """Follow a local JSON pointer, e.g. ``#/$defs/Question``.
 
     Remote pointers are refused rather than fetched: a schema that reaches out
@@ -92,7 +92,7 @@ def _lookup(root: Dict[str, Any], pointer: str) -> Dict[str, Any]:
     return node
 
 
-def resolve_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
+def resolve_refs(schema: dict[str, Any]) -> dict[str, Any]:
     """Inline every ``$ref`` and drop the ``$defs`` block.
 
     Pydantic emits a ``$ref`` for every nested model. Anthropic and xAI reject
@@ -128,7 +128,7 @@ def resolve_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
     return resolved
 
 
-def _split_nullable(node: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+def _split_nullable(node: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Unwrap ``Optional[X]`` into its inner schema plus a nullable flag.
 
     Pydantic renders ``Optional[X]`` as ``anyOf: [X, {"type": "null"}]``.
@@ -154,12 +154,12 @@ def _split_nullable(node: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     return merged, True
 
 
-def _constraint_prose(node: Dict[str, Any]) -> str:
+def _constraint_prose(node: dict[str, Any]) -> str:
     parts = [f"{k}={node[k]}" for k in _CONSTRAINT_KEYS if k in node]
     return f" (constraints: {', '.join(parts)})" if parts else ""
 
 
-def to_anthropic_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+def to_anthropic_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Schema for an Anthropic tool's ``input_schema``.
 
     The gentlest of the three dialects -- plain JSON Schema, extra keywords
@@ -172,7 +172,9 @@ def to_anthropic_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     return schema
 
 
-def anthropic_tool(model: Type[BaseModel], name: str = "emit_result", description: str = "") -> Dict[str, Any]:
+def anthropic_tool(
+    model: type[BaseModel], name: str = "emit_result", description: str = ""
+) -> dict[str, Any]:
     """Build the tool that Claude will be forced to call.
 
     This is Anthropic's substitute for ``response_format``, and it is a
@@ -191,7 +193,7 @@ def anthropic_tool(model: Type[BaseModel], name: str = "emit_result", descriptio
     }
 
 
-def to_xai_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+def to_xai_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Schema for xAI's ``response_format.json_schema``, strict mode on.
 
     Strict mode is what makes the output trustworthy, and it adds two rules
@@ -209,10 +211,10 @@ def to_xai_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     Both rules are applied here rather than trusted to the schema author.
     """
 
-    def convert(node: Dict[str, Any]) -> Dict[str, Any]:
+    def convert(node: dict[str, Any]) -> dict[str, Any]:
         node, nullable = _split_nullable(node)
         prose = _constraint_prose(node)
-        out: Dict[str, Any] = {k: v for k, v in node.items() if k in _XAI_KEEP}
+        out: dict[str, Any] = {k: v for k, v in node.items() if k in _XAI_KEEP}
         if prose:
             out["description"] = (out.get("description", "") + prose).strip()
 
@@ -246,7 +248,7 @@ def to_xai_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     }
 
 
-def _make_xai_nullable(node: Dict[str, Any]) -> None:
+def _make_xai_nullable(node: dict[str, Any]) -> None:
     """Widen a node's type to admit ``null``, in place.
 
     A node with no ``type`` at all (a bare enum, say) is left alone: strict
@@ -263,7 +265,7 @@ def _make_xai_nullable(node: Dict[str, Any]) -> None:
         node["type"] = [node_type, "null"]
 
 
-def to_gemini_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+def to_gemini_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Schema for Google's ``generationConfig.responseSchema``.
 
     Gemini's dialect looks like JSON Schema and is not:
@@ -284,10 +286,10 @@ def to_gemini_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     (a field with a default). Both end up as ``nullable: true``.
     """
 
-    def convert(node: Dict[str, Any], nullable: bool = False) -> Dict[str, Any]:
+    def convert(node: dict[str, Any], nullable: bool = False) -> dict[str, Any]:
         node, from_union = _split_nullable(node)
         nullable = nullable or from_union
-        out: Dict[str, Any] = {k: v for k, v in node.items() if k in _GEMINI_KEEP}
+        out: dict[str, Any] = {k: v for k, v in node.items() if k in _GEMINI_KEEP}
 
         node_type = node.get("type")
         if isinstance(node_type, list):
@@ -325,7 +327,7 @@ def to_gemini_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     return convert(resolve_refs(model.model_json_schema()))
 
 
-def json_hint(model: Type[BaseModel]) -> str:
+def json_hint(model: type[BaseModel]) -> str:
     """Render the schema as prose for the system prompt.
 
     Belt to the API's braces. The schema already makes malformed output
@@ -334,7 +336,7 @@ def json_hint(model: Type[BaseModel]) -> str:
     not always survive into every dialect's validator.
     """
     schema = resolve_refs(model.model_json_schema())
-    lines: List[str] = []
+    lines: list[str] = []
     required = set(schema.get("required", []))
     for name, prop in schema.get("properties", {}).items():
         prop, nullable = _split_nullable(prop)

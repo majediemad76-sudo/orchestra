@@ -24,7 +24,7 @@ CRITIC_FLAGS   ?=
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check lint run ui eval fixture eval-critic clean distclean
+.PHONY: help venv install test check ruff lint typecheck run ui eval fixture eval-critic clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -39,7 +39,13 @@ install: venv ## Install pinned dependencies
 test: ## Run the offline self check (no API keys, no network)
 	@$(PY) scripts/self_check.py
 
-check: lint test ## Compile every source file, then run the self check
+check: ruff test lint ## The gate: ruff, then the self check, then py_compile
+
+ruff: ## Lint and style-check every source file
+	@$(PY) -m ruff check .
+
+typecheck: ## Run mypy over the core modules (not part of `check` yet)
+	@$(PY) -m mypy
 
 lint: ## Byte-compile every source file
 	@$(PY) -m py_compile $(SOURCES) && echo "py_compile: OK"

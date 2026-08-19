@@ -20,18 +20,19 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, get_args
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from providers.schema_utils import (  # noqa: E402
+import controller as controller_module
+from providers.schema_utils import (
     resolve_refs,
     to_anthropic_schema,
     to_gemini_schema,
     to_xai_schema,
 )
-from schemas import (  # noqa: E402
+from schemas import (
     Criterion,
     CriterionCheck,
     CriticVerdict,
@@ -42,7 +43,7 @@ from schemas import (  # noqa: E402
     WorkerOutput,
 )
 
-FAILURES: List[str] = []
+FAILURES: list[str] = []
 CHECKS = 0
 
 CRITICAL_CRITERION = Criterion(
@@ -99,13 +100,17 @@ def check_pydantic_models() -> None:
     failing = CriterionCheck(criterion="b", passed=False, evidence="quoted", reason="because")
     check(CriticVerdict(checks=[passing], verdict="accept").score == 100, "CriticVerdict builds")
     check(
-        CriterionCheck(criterion="c", passed=True, evidence="x" * 300, reason="r").evidence.__len__() == 200,
+        len(CriterionCheck(criterion="c", passed=True, evidence="x" * 300, reason="r").evidence)
+        == 200,
         "CriterionCheck truncates evidence instead of rejecting it",
     )
 
     # The score is arithmetic, not a model output -- these are the rules the
     # accept decision now rests on.
-    check(CriticVerdict(checks=[passing, failing], verdict="accept").score == 50, "score is the pass ratio")
+    check(
+        CriticVerdict(checks=[passing, failing], verdict="accept").score == 50,
+        "score is the pass ratio",
+    )
     check(
         CriticVerdict(checks=[passing, passing, failing], verdict="revise").score == 67,
         "score rounds to the nearest whole percent",
@@ -145,7 +150,7 @@ def check_pydantic_models() -> None:
           "the score still counts every criterion, critical or not")
 
     # The Critic must not be able to reclassify a criterion it just failed.
-    from roles.critic import _reassert_criticality  # noqa: PLC0415
+    from roles.critic import _reassert_criticality
 
     plan = ManagerPlan(plan="p", worker_prompt="w", worker_type="text",
                        acceptance_criteria=[CRITICAL_CRITERION, OPTIONAL_CRITERION])
@@ -185,7 +190,10 @@ def check_pydantic_models() -> None:
     check(_reassert_criticality(invented, plan).checks[2].critical is True,
           "a criterion with no counterpart in the plan is treated as critical")
     mixed = CriticVerdict(checks=[passing, failing], verdict="revise")
-    check(mixed.met_criteria == ["a"] and mixed.failed_criteria == ["b"], "met/failed derive from checks")
+    check(
+        mixed.met_criteria == ["a"] and mixed.failed_criteria == ["b"],
+        "met/failed derive from checks",
+    )
     record = mixed.as_record()
     check(
         {"checks", "score", "all_passed", "met_criteria", "failed_criteria"} <= set(record),
@@ -193,6 +201,11 @@ def check_pydantic_models() -> None:
     )
     check(WorkerOutput(result="x").ok is True, "WorkerOutput builds")
     check(Task(goal="g").max_rounds == 4, "Task builds with defaults")
+    check(
+        set(get_args(controller_module.EscalationTrigger))
+        == set(get_args(Escalation.model_fields["trigger"].annotation)),
+        "the Controller's trigger literal matches the Escalation schema",
+    )
     check(
         Escalation(
             trigger="budget_exceeded",
@@ -281,8 +294,14 @@ def check_gemini() -> None:
     check("nullable" not in schema["properties"]["plan"], "required field is not nullable")
     check(schema["properties"]["worker_type"]["enum"] == ["text", "code"], "Literal maps to enum")
 
-    check(to_gemini_schema(Task)["properties"]["max_rounds"]["type"] == "INTEGER", "int maps to INTEGER")
-    check(to_gemini_schema(WorkerOutput)["properties"]["ok"]["type"] == "BOOLEAN", "bool maps to BOOLEAN")
+    check(
+        to_gemini_schema(Task)["properties"]["max_rounds"]["type"] == "INTEGER",
+        "int maps to INTEGER",
+    )
+    check(
+        to_gemini_schema(WorkerOutput)["properties"]["ok"]["type"] == "BOOLEAN",
+        "bool maps to BOOLEAN",
+    )
 
     # CriticVerdict is the only schema with a list of nested models, which is
     # the shape most likely to break a dialect conversion.
@@ -301,17 +320,29 @@ def check_ref_resolution() -> None:
     raw = ManagerPlan.model_json_schema()
     check("$defs" in json.dumps(raw), "pydantic really did emit $defs (the test is meaningful)")
     resolved = resolve_refs(raw)
-    check("$ref" not in json.dumps(resolved) and "$defs" not in resolved, "resolve_refs inlines everything")
+    check(
+        "$ref" not in json.dumps(resolved) and "$defs" not in resolved,
+        "resolve_refs inlines everything",
+    )
 
 
 def check_budget() -> None:
     print("\n[6] Budget guard")
     from budget import PRICING, BudgetGuard, price
 
-    check(set(PRICING) == {"claude-sonnet-5", "grok-4.6", "gemini-3.1-flash-lite"}, "all three models priced")
-    check(abs(price("claude-sonnet-5", 1_000_000, 1_000_000) - 12.0) < 1e-9, "sonnet: 2 in + 10 out = 12")
+    check(
+        set(PRICING) == {"claude-sonnet-5", "grok-4.6", "gemini-3.1-flash-lite"},
+        "all three models priced",
+    )
+    check(
+        abs(price("claude-sonnet-5", 1_000_000, 1_000_000) - 12.0) < 1e-9,
+        "sonnet: 2 in + 10 out = 12",
+    )
     check(abs(price("grok-4.6", 1_000_000, 1_000_000) - 8.0) < 1e-9, "grok: 2 in + 6 out = 8")
-    check(abs(price("gemini-3.1-flash-lite", 1_000_000, 1_000_000) - 1.75) < 1e-9, "gemini: 0.25 in + 1.5 out = 1.75")
+    check(
+        abs(price("gemini-3.1-flash-lite", 1_000_000, 1_000_000) - 1.75) < 1e-9,
+        "gemini: 0.25 in + 1.5 out = 1.75",
+    )
 
     guard = BudgetGuard(limit_usd=0.01)
     guard.charge("m", "grok-4.6", 1000, 1000)
@@ -322,7 +353,7 @@ def check_budget() -> None:
 
 
 def _fake_ask(index: int):
-    def ask(question: Question) -> Optional[int]:
+    def ask(question: Question) -> int | None:
         assert 2 <= len(question.options) <= 4, "escalation must offer 2-4 options"
         return index
 
@@ -340,12 +371,16 @@ def check_controller_state_machine() -> None:
     import controller
     from providers import ProviderResult
 
-    saved = (controller.manager_role.plan, controller.worker_role.execute, controller.critic_role.review)
+    saved = (
+        controller.manager_role.plan,
+        controller.worker_role.execute,
+        controller.critic_role.review,
+    )
     tmp = Path(tempfile.mkdtemp(prefix="orchestrator-selfcheck-"))
     saved_runs = controller.RUNS_DIR
     controller.RUNS_DIR = tmp
 
-    calls: Dict[str, int] = {"manager": 0, "worker": 0, "critic": 0}
+    calls: dict[str, int] = {"manager": 0, "worker": 0, "critic": 0}
 
     def fake_plan(task, previous_plan=None, verdict=None, worker_result="", user_answer="", **_):
         calls["manager"] += 1
@@ -356,7 +391,9 @@ def check_controller_state_machine() -> None:
             acceptance_criteria=[CRITICAL_CRITERION],
             worker_type="text",
             needs_user_input=needs_input,
-            question=Question(text="which tone?", options=["formal", "casual"]) if needs_input else None,
+            question=Question(text="which tone?", options=["formal", "casual"])
+            if needs_input
+            else None,
         )
         return plan, ProviderResult(data={}, model="grok-4.6", input_tokens=100, output_tokens=100)
 
@@ -387,7 +424,9 @@ def check_controller_state_machine() -> None:
                     # follow the checks, not this field.
                     verdict="accept",
                 ),
-                ProviderResult(data={}, model="gemini-3.1-flash-lite", input_tokens=100, output_tokens=100),
+                ProviderResult(
+                    data={}, model="gemini-3.1-flash-lite", input_tokens=100, output_tokens=100
+                ),
             )
 
         return fake_review
@@ -401,7 +440,8 @@ def check_controller_state_machine() -> None:
         check(summary["status"] == "accepted", "accepts when every criterion passes")
         check(summary["rounds"] == 1, "stops as soon as it is accepted")
         check(summary["budget"]["spent_usd"] > 0, "cost is accumulated")
-        lines = [json.loads(l) for l in (tmp / "selfcheck-accept.jsonl").read_text(encoding="utf-8").splitlines()]
+        log_text = (tmp / "selfcheck-accept.jsonl").read_text(encoding="utf-8")
+        lines = [json.loads(line) for line in log_text.splitlines()]
         events = {line["event"] for line in lines}
         check(
             {"run_start", "manager_plan", "worker_output", "critic_verdict", "run_end"} <= events,
@@ -441,7 +481,9 @@ def check_controller_state_machine() -> None:
         calls.update({"manager": 0, "worker": 0, "critic": 0})
         controller.critic_role.review = make_critic(False)
         summary = controller.run_task(
-            Task(goal="g", budget_usd=0.0005, max_rounds=6), ask=_fake_ask(2), run_id="selfcheck-budget"
+            Task(goal="g", budget_usd=0.0005, max_rounds=6),
+            ask=_fake_ask(2),
+            run_id="selfcheck-budget",
         )
         check(
             summary["escalations"][0]["trigger"] == "budget_exceeded",
@@ -459,7 +501,11 @@ def check_controller_state_machine() -> None:
         )
         check(summary["status"] == "stopped_by_user", "an unanswered escalation stops the run")
     finally:
-        controller.manager_role.plan, controller.worker_role.execute, controller.critic_role.review = saved
+        (
+            controller.manager_role.plan,
+            controller.worker_role.execute,
+            controller.critic_role.review,
+        ) = saved
         controller.RUNS_DIR = saved_runs
 
 
@@ -472,12 +518,16 @@ def check_fixture_builder() -> None:
     """
     print("\n[9] Fixture builder (scripts/make_fixtures.py)")
     sys.path.insert(0, str(ROOT / "scripts"))
-    import make_fixtures as mf  # noqa: PLC0415
+    import make_fixtures as mf
 
     source = mf.RunSource(
         run_id="r", path="p", goal="g", worker_prompt="w",
         criteria=[
-            {"text": "The output consists of exactly one sentence.", "critical": True, "check_method": ""},
+            {
+                "text": "The output consists of exactly one sentence.",
+                "critical": True,
+                "check_method": "",
+            },
             {"text": "fewer than 17 words", "critical": True, "check_method": ""},
         ],
         output="the original text", criteria_format="structured",
@@ -523,11 +573,17 @@ def check_fixture_builder() -> None:
           "an unparseable payload is left alone rather than mangled")
 
     # 3. One malformed entry must not discard the batch it arrived with.
-    from unittest.mock import patch  # noqa: PLC0415
+    from unittest.mock import patch
 
-    from providers import ProviderResult  # noqa: PLC0415
+    from providers import ProviderResult
 
-    payload = {"mutations": [item, {**item, "broken_criterion_index": ""}, {**item, "mutation_type": "tone"}]}
+    payload = {
+        "mutations": [
+            item,
+            {**item, "broken_criterion_index": ""},
+            {**item, "mutation_type": "tone"},
+        ]
+    }
     with patch.object(mf.anthropic, "call_structured",
                       return_value=ProviderResult(data=payload, model="claude-sonnet-5",
                                                   input_tokens=10, output_tokens=10)):
@@ -536,7 +592,7 @@ def check_fixture_builder() -> None:
           "one malformed mutation is skipped, the rest of the batch survives")
 
     # Accepted runs only -- a run the user waved through is not an accept case.
-    import tempfile  # noqa: PLC0415
+    import tempfile
 
     tmp = Path(tempfile.mkdtemp())
     def write_log(name, status):
@@ -558,8 +614,11 @@ def check_fixture_builder() -> None:
 
     # Legacy string criteria are promoted rather than discarded.
     legacy, fmt = mf._normalise_criteria(["under 150 words", "no jargon"])
-    check(fmt == "legacy" and legacy[0] == {"text": "under 150 words", "critical": True, "check_method": ""},
-          "legacy string criteria are promoted to critical, not dropped")
+    check(
+        fmt == "legacy"
+        and legacy[0] == {"text": "under 150 words", "critical": True, "check_method": ""},
+        "legacy string criteria are promoted to critical, not dropped",
+    )
 
 
 def check_retry_policy() -> None:
@@ -570,9 +629,9 @@ def check_retry_policy() -> None:
     This cost four fixtures on the first live grading run.
     """
     print("\n[10] Retry policy")
-    import httpx  # noqa: PLC0415
+    import httpx
 
-    from providers.retry_utils import (  # noqa: PLC0415
+    from providers.retry_utils import (
         MAX_RETRY_WAIT,
         ProviderError,
         is_retryable,
@@ -580,7 +639,9 @@ def check_retry_policy() -> None:
         wait_policy,
     )
 
-    gemini_429 = '{"error":{"code":429,"message":"Quota exceeded. Please retry in 30.6s.","status":"X"}}'
+    gemini_429 = (
+        '{"error":{"code":429,"message":"Quota exceeded. Please retry in 30.6s.","status":"X"}}'
+    )
     check(parse_retry_after(httpx.Response(429, text=gemini_429)) == 30.6,
           "the delay is read out of a Gemini 429 body")
     check(parse_retry_after(httpx.Response(429, text='{"retryDelay": "31s"}')) == 31.0,
@@ -601,8 +662,10 @@ def check_retry_policy() -> None:
 
     hinted = wait_policy(_State(ProviderError("google", "x", 429, retry_after=30.6)))
     check(31 <= hinted <= 32, "a stated delay is waited out, with a little slack")
-    check(wait_policy(_State(ProviderError("google", "x", 429, retry_after=9999))) == MAX_RETRY_WAIT,
-          "an absurd delay is capped rather than obeyed")
+    check(
+        wait_policy(_State(ProviderError("google", "x", 429, retry_after=9999))) == MAX_RETRY_WAIT,
+        "an absurd delay is capped rather than obeyed",
+    )
     check(wait_policy(_State(ProviderError("google", "x", 500), attempt=3)) > 0,
           "with no stated delay it falls back to exponential backoff")
 
@@ -617,20 +680,37 @@ def check_no_hardcoded_keys() -> None:
     import re
 
     sources = [p for p in ROOT.rglob("*.py") if ".venv" not in p.parts]
-    literal = re.compile(r"""(sk-[A-Za-z0-9_-]{12,}|xai-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})""")
-    offenders = [str(p.relative_to(ROOT)) for p in sources if literal.search(p.read_text(encoding="utf-8"))]
-    check(not offenders, f"no key literal in any source file{(' -> ' + ', '.join(offenders)) if offenders else ''}")
+    literal = re.compile(
+        r"""(sk-[A-Za-z0-9_-]{12,}|xai-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})"""
+    )
+    offenders = [
+        str(p.relative_to(ROOT))
+        for p in sources
+        if literal.search(p.read_text(encoding="utf-8"))
+    ]
+    check(
+        not offenders,
+        f"no key literal in any source file{(' -> ' + ', '.join(offenders)) if offenders else ''}",
+    )
 
     for var in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
-        used = any(var in p.read_text(encoding="utf-8") for p in sources if p.parts[-2] == "providers")
+        used = any(
+            var in p.read_text(encoding="utf-8") for p in sources if p.parts[-2] == "providers"
+        )
         check(used, f"{var} is read from the environment in providers/")
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     check(
         all(f"{v}=" in example for v in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")),
         ".env.example lists all three keys",
     )
-    check(all(line.split("=", 1)[1].strip() == "" for line in example.strip().splitlines()), ".env.example has no values")
-    check(not (ROOT / ".env").exists() or ".env" in (ROOT / ".gitignore").read_text(), ".env is git-ignored")
+    check(
+        all(line.split("=", 1)[1].strip() == "" for line in example.strip().splitlines()),
+        ".env.example has no values",
+    )
+    check(
+        not (ROOT / ".env").exists() or ".env" in (ROOT / ".gitignore").read_text(),
+        ".env is git-ignored",
+    )
 
 
 def main() -> int:

@@ -16,8 +16,6 @@ whatever is cheapest that week.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 from providers import ProviderResult, google
 from providers.schema_utils import json_hint
 from schemas import Criterion, CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
@@ -49,7 +47,7 @@ def build_user_message(plan: ManagerPlan, output: WorkerOutput) -> str:
     )
 
 
-def review(plan: ManagerPlan, output: WorkerOutput) -> Tuple[CriticVerdict, ProviderResult]:
+def review(plan: ManagerPlan, output: WorkerOutput) -> tuple[CriticVerdict, ProviderResult]:
     """Grade one Worker output against the plan's acceptance criteria."""
     result = google.call_structured(
         CriticVerdict,
@@ -95,7 +93,7 @@ def _reassert_criticality(verdict: CriticVerdict, plan: ManagerPlan) -> CriticVe
 
 
 def failed_worker_verdict(
-    reason: str, criteria: Optional[List[Criterion]] = None
+    reason: str, criteria: list[Criterion] | None = None
 ) -> CriticVerdict:
     """Synthesise a rejection for a Worker that produced nothing.
 

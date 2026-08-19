@@ -13,7 +13,6 @@ latency and add a failure mode to the accountant.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
 
 # How a charge was actually incurred. Both are real spend; they are not the
 # same kind of spend, and a log that blurs them cannot answer "what did this
@@ -21,7 +20,7 @@ from typing import Dict, List, Tuple
 API_BILLED = "api_billed"
 SUBSCRIPTION_EQUIVALENT = "subscription_equivalent"
 
-PRICING: Dict[str, Tuple[float, float]] = {
+PRICING: dict[str, tuple[float, float]] = {
     # model: (input $/1M, output $/1M)
     "claude-sonnet-5": (2.00, 10.00),
     "grok-4.6": (2.00, 6.00),
@@ -68,7 +67,7 @@ class BudgetGuard:
 
     limit_usd: float
     spent_usd: float = 0.0
-    entries: List[BudgetEntry] = field(default_factory=list)
+    entries: list[BudgetEntry] = field(default_factory=list)
 
     def charge(self, step: str, model: str, input_tokens: int, output_tokens: int) -> BudgetEntry:
         cost = price(model, input_tokens, output_tokens)
@@ -96,13 +95,13 @@ class BudgetGuard:
     def exceeded(self) -> bool:
         return self.spent_usd >= self.limit_usd
 
-    def by_model(self) -> Dict[str, float]:
-        totals: Dict[str, float] = {}
+    def by_model(self) -> dict[str, float]:
+        totals: dict[str, float] = {}
         for entry in self.entries:
             totals[entry.model] = totals.get(entry.model, 0.0) + entry.cost_usd
         return totals
 
-    def summary(self) -> Dict[str, object]:
+    def summary(self) -> dict[str, object]:
         return {
             "limit_usd": round(self.limit_usd, 6),
             "spent_usd": round(self.spent_usd, 6),

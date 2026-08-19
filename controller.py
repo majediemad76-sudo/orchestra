@@ -41,10 +41,11 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -79,7 +80,7 @@ class RunLog:
     $2" is answerable after the fact rather than reconstructible at best.
     """
 
-    def __init__(self, run_id: str, directory: Optional[Path] = None):
+    def __init__(self, run_id: str, directory: Path | None = None):
         directory = directory or RUNS_DIR
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / f"{run_id}.jsonl"
@@ -87,7 +88,7 @@ class RunLog:
 
     def write(self, event: str, **data: Any) -> None:
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "run_id": self.run_id,
             "event": event,
             **data,
@@ -110,28 +111,28 @@ class RunState:
     budget: BudgetGuard
     round: int = 0
     consecutive_rejections: int = 0
-    plan: Optional[ManagerPlan] = None
-    output: Optional[WorkerOutput] = None
-    verdict: Optional[CriticVerdict] = None
+    plan: ManagerPlan | None = None
+    output: WorkerOutput | None = None
+    verdict: CriticVerdict | None = None
     user_answer: str = ""
     best_result: str = ""
     best_score: int = -1
-    escalations: List[Dict[str, Any]] = field(default_factory=list)
+    escalations: list[dict[str, Any]] = field(default_factory=list)
 
 
 # --- talking to whoever is driving -----------------------------------------
 
 # The loop's own asker: an option index, or None meaning "no answer, stop".
-AnswerFn = Callable[[Question], Optional[int]]
+AnswerFn = Callable[[Question], int | None]
 
 # Embedder-facing hooks. Deliberately narrower than the internals they wrap:
 # progress is one-way, and an escalation answer is a label the caller saw --
 # neither can express an action the Controller did not already offer.
-ProgressFn = Callable[[str, Dict[str, Any]], None]
+ProgressFn = Callable[[str, dict[str, Any]], None]
 EscalationFn = Callable[[Question], str]
 
 
-def ask_on_console(question: Question) -> Optional[int]:
+def ask_on_console(question: Question) -> int | None:
     """Ask on the terminal. ``None`` means no answer, which always means stop.
 
     Injected rather than called directly so the loop can be driven by tests, or
@@ -169,7 +170,7 @@ def _asker_from_escalation(on_escalation: EscalationFn) -> AnswerFn:
     run without anyone having chosen either.
     """
 
-    def ask(question: Question) -> Optional[int]:
+    def ask(question: Question) -> int | None:
         answer = on_escalation(question)
         if answer is None:
             return None
@@ -191,7 +192,7 @@ def _asker_from_escalation(on_escalation: EscalationFn) -> AnswerFn:
     return ask
 
 
-def _progress_emitter(on_progress: Optional[ProgressFn]) -> ProgressFn:
+def _progress_emitter(on_progress: ProgressFn | None) -> ProgressFn:
     """Wrap the progress hook so a broken observer cannot kill a paid run.
 
     Reporting is not part of the work. A UI callback that raises -- a closed
@@ -202,23 +203,29 @@ def _progress_emitter(on_progress: Optional[ProgressFn]) -> ProgressFn:
     if on_progress is None:
         return lambda event, data: None
 
-    def emit(event: str, data: Dict[str, Any]) -> None:
+    def emit(event: str, data: dict[str, Any]) -> None:
         try:
             on_progress(event, data)
-        except Exception as exc:  # noqa: BLE001 -- observers must not be fatal
+        except Exception as exc:
             console.print(f"[yellow]on_progress({event}) raised {exc!r}; continuing[/yellow]")
 
     return emit
 
 
+# The closed set of reasons to interrupt a human, spelled out so the type
+# checker enforces it at every call site. schemas.Escalation is the source of
+# truth; self_check asserts the two stay identical.
+EscalationTrigger = Literal["two_rejections", "manager_needs_input", "budget_exceeded"]
+
+
 def _escalate(
     state: RunState,
     log: RunLog,
-    trigger: str,
+    trigger: EscalationTrigger,
     reason: str,
-    options: List[Tuple[str, str]],
+    options: list[tuple[str, str]],
     ask: AnswerFn,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Raise one escalation and return ``(action, chosen label)``.
 
     The 2..4 bound is asserted here as well as in ``Question`` -- this is the
@@ -247,13 +254,13 @@ def _escalate(
 
 def run_task(
     task: Task,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     ask: AnswerFn = ask_on_console,
-    run_id: Optional[str] = None,
-    on_progress: Optional[ProgressFn] = None,
-    on_escalation: Optional[EscalationFn] = None,
-    stop_flag: Optional[threading.Event] = None,
-) -> Dict[str, Any]:
+    run_id: str | None = None,
+    on_progress: ProgressFn | None = None,
+    on_escalation: EscalationFn | None = None,
+    stop_flag: threading.Event | None = None,
+) -> dict[str, Any]:
     """Run the Manager/Worker/Critic loop to acceptance, exhaustion or halt.
 
     The three optional hooks let another process drive this loop without
@@ -277,7 +284,8 @@ def run_task(
     With all three omitted this is the original headless behaviour, down to the
     console prompts.
     """
-    run_id = run_id or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    run_id = run_id or f"{stamp}-{uuid.uuid4().hex[:6]}"
     log = RunLog(run_id)
     state = RunState(task=task, budget=BudgetGuard(limit_usd=task.budget_usd))
     emit = _progress_emitter(on_progress)
@@ -343,7 +351,10 @@ def run_task(
             user_answer=state.user_answer,
         )
         entry = state.budget.charge(
-            f"round{state.round}.manager", plan_call.model, plan_call.input_tokens, plan_call.output_tokens
+            f"round{state.round}.manager",
+            plan_call.model,
+            plan_call.input_tokens,
+            plan_call.output_tokens,
         )
         state.plan = plan
         state.user_answer = ""
@@ -357,7 +368,9 @@ def run_task(
             input_tokens=entry.input_tokens,
             output_tokens=entry.output_tokens,
         )
-        console.print(Panel(plan.plan, title=f"Manager plan ({plan.worker_type})", border_style="cyan"))
+        console.print(
+            Panel(plan.plan, title=f"Manager plan ({plan.worker_type})", border_style="cyan")
+        )
         emit(
             "manager_plan",
             {
@@ -482,7 +495,11 @@ def run_task(
                 "\n".join(lines),
                 title=f"Critic verdict — {verdict.score}% ({len(verdict.met_criteria)}"
                 f"/{len(verdict.checks)} criteria)"
-                + (f" — blocked by {len(verdict.blocking_failures)}" if verdict.blocking_failures else ""),
+                + (
+                    f" — blocked by {len(verdict.blocking_failures)}"
+                    if verdict.blocking_failures
+                    else ""
+                ),
                 border_style="green" if verdict.accepted else "magenta",
             )
         )
@@ -563,19 +580,20 @@ def run_task(
     return summary
 
 
-def print_summary(summary: Dict[str, Any]) -> None:
+def print_summary(summary: dict[str, Any]) -> None:
     table = Table(title="Run summary", show_header=False)
     table.add_row("status", str(summary["status"]))
     table.add_row("rounds", str(summary["rounds"]))
     table.add_row("score", str(summary["score"]))
-    table.add_row("spent", f"{summary['budget']['spent_usd']:.4f}$ / {summary['budget']['limit_usd']:.2f}$")
+    spent = summary["budget"]
+    table.add_row("spent", f"{spent['spent_usd']:.4f}$ / {spent['limit_usd']:.2f}$")
     table.add_row("log", summary["log_path"])
     console.print(table)
     if summary["result"]:
         console.print(Panel(summary["result"][:4000], title="Output", border_style="green"))
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="Multi-model orchestrator")
     parser.add_argument("goal", help="what you want done")

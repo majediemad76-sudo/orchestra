@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Type
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -36,14 +36,14 @@ def _api_key() -> str:
 
 @with_retry
 def call_structured(
-    schema_model: Type[BaseModel],
+    schema_model: type[BaseModel],
     system: str,
     user: str,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8000,
     timeout: float = 180.0,
 ) -> ProviderResult:
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": [
@@ -68,7 +68,9 @@ def call_structured(
     try:
         data = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ProviderError("xai", f"schema-constrained reply was not JSON: {content[:400]}") from exc
+        raise ProviderError(
+            "xai", f"schema-constrained reply was not JSON: {content[:400]}"
+        ) from exc
     if not isinstance(data, dict):
         raise ProviderError("xai", f"expected a JSON object, got {type(data).__name__}")
 

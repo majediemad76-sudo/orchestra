@@ -14,7 +14,6 @@ subprocess, would not have.
 from __future__ import annotations
 
 import json
-from typing import Optional, Tuple
 
 from providers import ProviderResult, xai
 from providers.schema_utils import json_hint
@@ -37,8 +36,8 @@ def _system() -> str:
 
 def build_user_message(
     task: Task,
-    previous_plan: Optional[ManagerPlan] = None,
-    verdict: Optional[CriticVerdict] = None,
+    previous_plan: ManagerPlan | None = None,
+    verdict: CriticVerdict | None = None,
     worker_result: str = "",
     user_answer: str = "",
 ) -> str:
@@ -68,11 +67,11 @@ def build_user_message(
 
 def plan(
     task: Task,
-    previous_plan: Optional[ManagerPlan] = None,
-    verdict: Optional[CriticVerdict] = None,
+    previous_plan: ManagerPlan | None = None,
+    verdict: CriticVerdict | None = None,
     worker_result: str = "",
     user_answer: str = "",
-) -> Tuple[ManagerPlan, ProviderResult]:
+) -> tuple[ManagerPlan, ProviderResult]:
     """Produce a plan for this round.
 
     Returns the validated plan alongside the raw call, because the Controller

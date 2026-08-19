@@ -29,19 +29,19 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
-from rich.console import Console  # noqa: E402
-from rich.table import Table  # noqa: E402
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
 
-from budget import BudgetGuard  # noqa: E402
-from providers.retry_utils import ProviderError  # noqa: E402
-from roles import critic as critic_role  # noqa: E402
-from schemas import Criterion, ManagerPlan, WorkerOutput  # noqa: E402
+from budget import BudgetGuard
+from providers.retry_utils import ProviderError
+from roles import critic as critic_role
+from schemas import Criterion, ManagerPlan, WorkerOutput
 
 DEFAULT_FIXTURES = ROOT / "evals" / "critic_fixtures.jsonl"
 DEFAULT_RESULTS = ROOT / "evals" / "results"
@@ -53,22 +53,22 @@ console = Console()
 class Outcome:
     fixture_id: str
     expected: str
-    mutation_type: Optional[str]
-    accepted: Optional[bool] = None
+    mutation_type: str | None
+    accepted: bool | None = None
     correct: bool = False
-    caught_named_criterion: Optional[bool] = None
-    score: Optional[int] = None
+    caught_named_criterion: bool | None = None
+    score: int | None = None
     cost_usd: float = 0.0
     error: str = ""
 
 
 @dataclass
 class Report:
-    outcomes: List[Outcome] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    outcomes: list[Outcome] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
-def load_fixtures(path: Path, include_unreviewed: bool) -> List[Dict[str, Any]]:
+def load_fixtures(path: Path, include_unreviewed: bool) -> list[dict[str, Any]]:
     rows, skipped = [], 0
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -88,7 +88,7 @@ def load_fixtures(path: Path, include_unreviewed: bool) -> List[Dict[str, Any]]:
     return rows
 
 
-def as_plan(row: Dict[str, Any]) -> ManagerPlan:
+def as_plan(row: dict[str, Any]) -> ManagerPlan:
     """Rebuild the Manager's plan so the Critic sees exactly what it saw live."""
     criteria = [
         Criterion(
@@ -106,7 +106,7 @@ def as_plan(row: Dict[str, Any]) -> ManagerPlan:
     )
 
 
-def judge(row: Dict[str, Any], budget: BudgetGuard) -> Outcome:
+def judge(row: dict[str, Any], budget: BudgetGuard) -> Outcome:
     outcome = Outcome(
         fixture_id=row["fixture_id"],
         expected=row["expected_verdict"],
@@ -122,7 +122,9 @@ def judge(row: Dict[str, Any], budget: BudgetGuard) -> Outcome:
     outcome.cost_usd = entry.cost_usd
     outcome.accepted = verdict.accepted
     outcome.score = verdict.score
-    outcome.correct = verdict.accepted if row["expected_verdict"] == "accept" else not verdict.accepted
+    outcome.correct = (
+        verdict.accepted if row["expected_verdict"] == "accept" else not verdict.accepted
+    )
 
     named = row.get("broken_criterion")
     if named:
@@ -135,7 +137,7 @@ def judge(row: Dict[str, Any], budget: BudgetGuard) -> Outcome:
     return outcome
 
 
-def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> Dict[str, Any]:
+def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[str, Any]:
     ran = [o for o in report.outcomes if not o.error]
     accepts = [o for o in ran if o.expected == "accept"]
     revises = [o for o in ran if o.expected == "revise"]
@@ -154,7 +156,7 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> Dict[st
     )
     console.print(headline)
 
-    by_type: Dict[str, List[Outcome]] = defaultdict(list)
+    by_type: dict[str, list[Outcome]] = defaultdict(list)
     for outcome in revises:
         by_type[outcome.mutation_type or "?"].append(outcome)
 
@@ -220,7 +222,7 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> Dict[st
     }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="Grade the Critic against reviewed fixtures")
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
@@ -291,7 +293,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary = print_report(report, budget, elapsed)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_path = args.out / f"critic-{stamp}.json"
     out_path.write_text(
         json.dumps(

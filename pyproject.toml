@@ -1,0 +1,31 @@
+# Tool configuration only -- this project is run, not packaged.
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+exclude = [".venv", "runs", "evals/results"]
+
+[tool.ruff.lint]
+# Correctness first (E/F/W/B), then the rules that keep this codebase's own
+# conventions honest: import order, modern annotations, and the simplification
+# and datetime checks that have each caught a real bug here.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "DTZ", "RUF"]
+ignore = [
+    # The controller and the providers deliberately swallow broad exceptions at
+    # a few named boundaries; each one carries a comment explaining why a
+    # failure there must be reported rather than raised.
+    "RUF001", "RUF002", "RUF003",  # Persian text is full of "ambiguous" unicode
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts insert the project root on sys.path before importing it.
+"scripts/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["controller.py", "budget.py", "schemas.py", "roles", "providers"]
+ignore_missing_imports = true
+# Not a gate yet: the annotations are being tightened file by file. `make
+# typecheck` reports the remaining ground.
+check_untyped_defs = true
+warn_unused_ignores = true

@@ -12,7 +12,7 @@ cannot be quietly forgotten at a call site.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -30,7 +30,7 @@ class Question(BaseModel):
     """
 
     text: str = Field(description="The question to ask the user.")
-    options: List[str] = Field(
+    options: list[str] = Field(
         min_length=2,
         max_length=4,
         description="Between 2 and 4 concrete options the user can pick from.",
@@ -46,7 +46,9 @@ class Task(BaseModel):
 
     goal: str = Field(description="What the user wants.")
     context: str = Field(default="", description="Any extra context supplied by the user.")
-    max_rounds: int = Field(default=4, ge=1, description="Hard cap on Manager/Worker/Critic rounds.")
+    max_rounds: int = Field(
+        default=4, ge=1, description="Hard cap on Manager/Worker/Critic rounds."
+    )
     budget_usd: float = Field(default=0.50, gt=0, description="Dollar ceiling for the whole run.")
 
 
@@ -62,7 +64,7 @@ class ManagerPlan(BaseModel):
     worker_prompt: str = Field(
         description="Self-contained instruction for the worker. The worker sees no history."
     )
-    acceptance_criteria: List[Criterion] = Field(
+    acceptance_criteria: list[Criterion] = Field(
         min_length=1,
         description=(
             "Objectively checkable criteria, not matters of taste. At least one must be "
@@ -76,7 +78,7 @@ class ManagerPlan(BaseModel):
         default=False,
         description="True only when required information is missing and guessing is risky.",
     )
-    question: Optional[Question] = Field(
+    question: Question | None = Field(
         default=None, description="Required when needs_user_input is true."
     )
 
@@ -137,7 +139,9 @@ class CriterionCheck(BaseModel):
     cannot point at is a criterion it did not really check.
     """
 
-    criterion: str = Field(description="The criterion text, copied exactly as the Manager wrote it.")
+    criterion: str = Field(
+        description="The criterion text, copied exactly as the Manager wrote it."
+    )
     passed: bool = Field(description="Whether the output satisfies this criterion.")
     critical: bool = Field(
         default=False,
@@ -184,7 +188,7 @@ class CriticVerdict(BaseModel):
     Manager, who may then ask the user.
     """
 
-    checks: List[CriterionCheck] = Field(
+    checks: list[CriterionCheck] = Field(
         default_factory=list,
         description="One entry per acceptance criterion, in the order they were given.",
     )
@@ -199,7 +203,7 @@ class CriticVerdict(BaseModel):
         return bool(self.checks) and all(check.passed for check in self.checks)
 
     @property
-    def blocking_failures(self) -> List[str]:
+    def blocking_failures(self) -> list[str]:
         """Critical criteria that failed. These are what stop a round."""
         return [check.criterion for check in self.checks if check.critical and not check.passed]
 
@@ -236,14 +240,14 @@ class CriticVerdict(BaseModel):
         return round(100 * sum(check.passed for check in self.checks) / len(self.checks))
 
     @property
-    def met_criteria(self) -> List[str]:
+    def met_criteria(self) -> list[str]:
         return [check.criterion for check in self.checks if check.passed]
 
     @property
-    def failed_criteria(self) -> List[str]:
+    def failed_criteria(self) -> list[str]:
         return [check.criterion for check in self.checks if not check.passed]
 
-    def as_record(self) -> Dict[str, Any]:
+    def as_record(self) -> dict[str, Any]:
         """Serialisation for the run log: the raw checks plus what they imply.
 
         The derived values are written out rather than left to be recomputed,

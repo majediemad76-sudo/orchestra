@@ -28,17 +28,17 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
-from rich.console import Console  # noqa: E402
-from rich.table import Table  # noqa: E402
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
 
-from controller import run_task  # noqa: E402
-from schemas import Question, Task  # noqa: E402
+from controller import run_task
+from schemas import Question, Task
 
 DEFAULT_TASKS = ROOT / "evals" / "tasks.jsonl"
 DEFAULT_RESULTS = ROOT / "evals" / "results"
@@ -47,7 +47,7 @@ REQUIRED_KEYS = ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")
 console = Console()
 
 
-def _no_escalation(question: Question) -> Optional[int]:
+def _no_escalation(question: Question) -> int | None:
     """The suite's answer to every escalation: none.
 
     Returning ``None`` is the Controller's documented "no answer" path, which
@@ -61,18 +61,18 @@ def _no_escalation(question: Question) -> Optional[int]:
 class TaskResult:
     id: str
     status: str = "not_run"
-    score: Optional[int] = None
+    score: int | None = None
     rounds: int = 0
     cost_usd: float = 0.0
     duration_s: float = 0.0
-    escalations: List[str] = field(default_factory=list)
+    escalations: list[str] = field(default_factory=list)
     passed: bool = False
-    failures: List[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
     log_path: str = ""
     result_preview: str = ""
 
 
-def load_tasks(path: Path, only: List[str]) -> List[Dict[str, Any]]:
+def load_tasks(path: Path, only: list[str]) -> list[dict[str, Any]]:
     tasks = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -92,7 +92,7 @@ def load_tasks(path: Path, only: List[str]) -> List[Dict[str, Any]]:
     return tasks
 
 
-def grade(spec: Dict[str, Any], summary: Dict[str, Any]) -> List[str]:
+def grade(spec: dict[str, Any], summary: dict[str, Any]) -> list[str]:
     """Check a finished run against the task's expectations.
 
     The checks are deliberately external to the Critic. A suite that graded
@@ -100,12 +100,11 @@ def grade(spec: Dict[str, Any], summary: Dict[str, Any]) -> List[str]:
     Critic was simply wrong -- the same self-verification trap the Critic is
     a separate vendor to avoid.
     """
-    failures: List[str] = []
+    failures: list[str] = []
 
     expected_status = spec.get("expect_status", "accepted")
-    if expected_status != "any":
-        if not summary["status"].startswith(expected_status):
-            failures.append(f"status {summary['status']} != {expected_status}")
+    if expected_status != "any" and not summary["status"].startswith(expected_status):
+        failures.append(f"status {summary['status']} != {expected_status}")
 
     # Acceptance is binary now, so min_score is no longer a duplicate of the
     # accept rule -- it measures *how much* of the criteria set held up, which
@@ -130,7 +129,7 @@ def grade(spec: Dict[str, Any], summary: Dict[str, Any]) -> List[str]:
     return failures
 
 
-def run_one(spec: Dict[str, Any], suite_id: str) -> TaskResult:
+def run_one(spec: dict[str, Any], suite_id: str) -> TaskResult:
     outcome = TaskResult(id=spec["id"])
     task = Task(
         goal=spec["goal"],
@@ -145,7 +144,7 @@ def run_one(spec: Dict[str, Any], suite_id: str) -> TaskResult:
             ask=_no_escalation,
             run_id=f"eval-{suite_id}-{spec['id']}",
         )
-    except Exception as exc:  # noqa: BLE001 -- one bad task must not end the suite
+    except Exception as exc:
         outcome.status = "crashed"
         outcome.failures = [f"{type(exc).__name__}: {exc}"]
         outcome.duration_s = round(time.time() - started, 2)
@@ -164,7 +163,7 @@ def run_one(spec: Dict[str, Any], suite_id: str) -> TaskResult:
     return outcome
 
 
-def print_scorecard(results: List[TaskResult], ceiling: float, elapsed: float) -> None:
+def print_scorecard(results: list[TaskResult], ceiling: float, elapsed: float) -> None:
     table = Table(title="Eval scorecard", header_style="bold")
     table.add_column("Task")
     table.add_column("Result")
@@ -208,12 +207,14 @@ def print_scorecard(results: List[TaskResult], ceiling: float, elapsed: float) -
     console.print(summary)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="Run the eval suite against the live APIs")
     parser.add_argument("--tasks", type=Path, default=DEFAULT_TASKS)
     parser.add_argument("--budget", type=float, default=1.00, help="ceiling for the whole suite")
-    parser.add_argument("--only", action="append", default=[], help="run just this task id (repeatable)")
+    parser.add_argument(
+        "--only", action="append", default=[], help="run just this task id (repeatable)"
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--yes", action="store_true", help="skip the spend confirmation")
     args = parser.parse_args(argv)
@@ -240,8 +241,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             console.print("aborted")
             return 1
 
-    suite_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    results: List[TaskResult] = []
+    suite_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    results: list[TaskResult] = []
     spent = 0.0
     started = time.time()
 
