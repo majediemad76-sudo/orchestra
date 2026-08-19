@@ -15,6 +15,8 @@ protect and a user it can ask.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 from tenacity import (
     RetryCallState,
@@ -24,8 +26,13 @@ from tenacity import (
     wait_exponential,
 )
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 4
 RETRYABLE_STATUS = {408, 409, 429}
+
+# Never wait longer than this on a provider's say-so. A quota that needs more
+# than a minute is a capacity problem, not a blip, and the caller has a budget
+# and a user it can report to.
+MAX_RETRY_WAIT = 75.0
 
 
 class ProviderError(RuntimeError):
@@ -34,13 +41,24 @@ class ProviderError(RuntimeError):
     ``status`` stays ``None`` for local failures (a missing key, an unparseable
     body) -- which is what makes them non-retryable by construction rather than
     by an explicit rule.
+
+    ``retry_after`` carries the delay the provider itself asked for. Guessing
+    with exponential backoff when the server has already said "30 seconds" is
+    how a run burns its attempts inside a window that was never going to open.
     """
 
-    def __init__(self, provider: str, message: str, status: int | None = None):
+    def __init__(
+        self,
+        provider: str,
+        message: str,
+        status: int | None = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(f"[{provider}] {message}")
         self.provider = provider
         self.status = status
         self.message = message
+        self.retry_after = retry_after
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -61,13 +79,50 @@ def _reraise(state: RetryCallState):
         state.outcome.result()
 
 
+_BACKOFF = wait_exponential(multiplier=2, min=1, max=30)
+
+
+def wait_policy(state: RetryCallState) -> float:
+    """Obey the provider's own retry delay; fall back to exponential backoff."""
+    exc = state.outcome.exception() if state.outcome else None
+    suggested = getattr(exc, "retry_after", None)
+    if suggested:
+        # A second of slack: waking up exactly on the boundary tends to land
+        # on the wrong side of the provider's clock.
+        return min(float(suggested) + 1.0, MAX_RETRY_WAIT)
+    return _BACKOFF(state)
+
+
 with_retry = retry(
     retry=retry_if_exception(is_retryable),
     stop=stop_after_attempt(MAX_ATTEMPTS),
-    wait=wait_exponential(multiplier=1, min=1, max=20),
+    wait=wait_policy,
     retry_error_callback=_reraise,
     reraise=True,
 )
+
+
+# "Please retry in 30.6s", "retryDelay": "31s", and the like.
+_DELAY_PATTERN = re.compile(
+    r"retry(?:_?delay|\s+in)?[\"\s:]*([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE
+)
+
+
+def parse_retry_after(response: httpx.Response) -> float | None:
+    """Read the delay a provider asked for, from the header or the body.
+
+    The header is the standard place; Gemini puts it in the JSON body instead,
+    and OpenAI-compatible endpoints vary. Reading both is cheaper than being
+    surprised by whichever one this vendor uses today.
+    """
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass  # HTTP-date form; fall through to the body
+    match = _DELAY_PATTERN.search(response.text[:2000])
+    return float(match.group(1)) if match else None
 
 
 def raise_for_status(provider: str, response: httpx.Response) -> None:
@@ -84,4 +139,5 @@ def raise_for_status(provider: str, response: httpx.Response) -> None:
         provider,
         f"HTTP {response.status_code}: {body}",
         status=response.status_code,
+        retry_after=parse_retry_after(response),
     )

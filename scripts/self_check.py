@@ -562,6 +562,56 @@ def check_fixture_builder() -> None:
           "legacy string criteria are promoted to critical, not dropped")
 
 
+def check_retry_policy() -> None:
+    """A provider that says 'retry in 30s' must not be second-guessed.
+
+    The exponential backoff alone tops out below a rate-limit window, so a run
+    would exhaust its attempts inside a window that was never going to open.
+    This cost four fixtures on the first live grading run.
+    """
+    print("\n[10] Retry policy")
+    import httpx  # noqa: PLC0415
+
+    from providers.retry_utils import (  # noqa: PLC0415
+        MAX_RETRY_WAIT,
+        ProviderError,
+        is_retryable,
+        parse_retry_after,
+        wait_policy,
+    )
+
+    gemini_429 = '{"error":{"code":429,"message":"Quota exceeded. Please retry in 30.6s.","status":"X"}}'
+    check(parse_retry_after(httpx.Response(429, text=gemini_429)) == 30.6,
+          "the delay is read out of a Gemini 429 body")
+    check(parse_retry_after(httpx.Response(429, text='{"retryDelay": "31s"}')) == 31.0,
+          "the delay is read out of a retryDelay field")
+    check(parse_retry_after(httpx.Response(429, headers={"retry-after": "12"}, text="{}")) == 12.0,
+          "the standard Retry-After header is read")
+    check(parse_retry_after(httpx.Response(500, text="boom")) is None,
+          "a response with no stated delay yields None")
+
+    class _State:
+        def __init__(self, exc, attempt=1):
+            class _Outcome:
+                def exception(inner_self):
+                    return exc
+            self.outcome = _Outcome()
+            self.attempt_number = attempt
+            self.idle_for = 0.0
+
+    hinted = wait_policy(_State(ProviderError("google", "x", 429, retry_after=30.6)))
+    check(31 <= hinted <= 32, "a stated delay is waited out, with a little slack")
+    check(wait_policy(_State(ProviderError("google", "x", 429, retry_after=9999))) == MAX_RETRY_WAIT,
+          "an absurd delay is capped rather than obeyed")
+    check(wait_policy(_State(ProviderError("google", "x", 500), attempt=3)) > 0,
+          "with no stated delay it falls back to exponential backoff")
+
+    check(is_retryable(ProviderError("google", "x", 429)), "429 is retryable")
+    check(is_retryable(ProviderError("google", "x", 503)), "5xx is retryable")
+    check(not is_retryable(ProviderError("google", "x", 400)), "400 is not retryable")
+    check(not is_retryable(ProviderError("google", "x", 401)), "401 is not retryable")
+
+
 def check_no_hardcoded_keys() -> None:
     print("\n[8] No hard-coded keys")
     import re
@@ -593,6 +643,7 @@ def main() -> int:
     check_budget()
     check_controller_state_machine()
     check_fixture_builder()
+    check_retry_policy()
     check_no_hardcoded_keys()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

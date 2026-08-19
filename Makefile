@@ -18,10 +18,13 @@ FIXTURE_RUNS   ?= 10
 FIXTURE_BUDGET ?= 0.50
 # Extra flags, e.g. FIXTURE_FLAGS=--yes for a non-interactive shell.
 FIXTURE_FLAGS  ?=
+# Critic grading run.
+CRITIC_BUDGET  ?= 0.50
+CRITIC_FLAGS   ?=
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check lint run ui eval fixture clean distclean
+.PHONY: help venv install test check lint run ui eval fixture eval-critic clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -55,6 +58,10 @@ eval: ## Run the eval suite against the live APIs -- costs money, needs .env
 fixture: ## Draft critic fixtures from accepted runs -- costs money, needs .env
 	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
 	$(PY) scripts/make_fixtures.py --limit $(FIXTURE_RUNS) --budget $(FIXTURE_BUDGET) $(FIXTURE_FLAGS)
+
+eval-critic: ## Grade the Critic against reviewed fixtures -- costs money, needs .env
+	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
+	$(PY) scripts/eval_critic.py --budget $(CRITIC_BUDGET) $(CRITIC_FLAGS)
 
 clean: ## Remove bytecode caches and self-check run logs
 	@find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} +
