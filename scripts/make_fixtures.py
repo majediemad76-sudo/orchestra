@@ -104,9 +104,23 @@ benign    -- rewrite the surface and break NOTHING. Reorder clauses, swap
 console = Console()
 
 
+# How hard the violation is to see. The distinction is the entire point of a
+# judge benchmark: "walking cures diabetes" is caught by anything, while
+# "walking can help with blood sugar control" is the sentence a real reviewer
+# argues about, and only the second one measures judgement.
+SEVERITIES = ("blatant", "borderline", "none")
+
+
 class Mutation(BaseModel):
     """One deliberately broken copy of an accepted output."""
 
+    severity: str = Field(
+        default="blatant",
+        description=(
+            "blatant = an unmissable violation. borderline = defensible on its face, "
+            "violating the criterion only on a careful reading. none = a benign rewrite."
+        ),
+    )
     mutation_type: str = Field(
         description="One of: quantitative, language, omission, tone, factual."
     )
@@ -250,13 +264,30 @@ of criteria. Produce mutated copies. Each mutated copy must:
 3. Be a complete, natural-looking output. Never annotate the text, never mark
    the change, never explain inside the output itself. A judge must not be able
    to spot the mutation by its formatting.
+3b. Respect every counted limit. If a criterion caps words, lines or sentences,
+   REPLACE text rather than appending to it -- an inserted sentence that pushes
+   the output past a word cap has broken two criteria, and a mutation that
+   breaks two criteria is useless as a test case. Count before you answer.
 4. Stay in the same language as the original, unless the mutation type is
    'language' -- that one changes the language deliberately.
 
 Mutation types:
 {guide}
 
-Return one mutation per requested type, in the order requested."""
+Severity, which is separate from type and matters more:
+
+blatant    -- the violation is unmissable. Any careful reader catches it in one
+    pass. Example, against "make no therapeutic claim": "Walking cures
+    diabetes."
+borderline -- the text stays defensible on its face and violates the criterion
+    only on a careful reading. It is the sentence a real reviewer would argue
+    about. Same criterion: "Walking can help with blood sugar control" -- it
+    hedges, it sounds reasonable, and it is still a therapeutic claim.
+    A borderline mutation must NOT announce itself: no absolute words, no
+    obvious overreach, nothing that reads as a mistake at a glance.
+none       -- for benign rewrites, which violate nothing.
+
+Return one mutation per requested (type, severity) pair, in the order requested."""
 
 
 def request_mutations(
@@ -264,6 +295,8 @@ def request_mutations(
     types: Iterable[str],
     model: str,
     max_tokens: int,
+    severity: str = "blatant",
+    criterion_index: int = 0,
 ) -> tuple[list[Mutation], list[str], int, int]:
     """One structured call to Claude.
 
@@ -278,13 +311,20 @@ def request_mutations(
         for i, c in enumerate(source.criteria, start=1)
     )
     wanted = list(types)
+    asked_severity = "none" if all(t in BENIGN_TYPES for t in wanted) else severity
     user = (
         f"TASK GIVEN TO THE WORKER:\n{source.worker_prompt or source.goal}\n\n"
         f"ACCEPTANCE CRITERIA (all currently satisfied):\n{criteria_block}\n\n"
         f"ACCEPTED OUTPUT:\n{source.output}\n\n"
         f"Produce exactly {len(wanted)} mutations, one of each of these types, "
-        f"in this order: {', '.join(wanted)}."
+        f"in this order: {', '.join(wanted)}. "
+        f"Every one of them must have severity: {asked_severity}."
     )
+    if criterion_index and asked_severity != "none":
+        user += (
+            f"\n\nBreak criterion number {criterion_index} and no other. "
+            "Set broken_criterion_index to exactly that number."
+        )
     result = anthropic.call_structured(
         MutationSet,
         system=SYSTEM.format(guide=MUTATION_GUIDE),
@@ -342,14 +382,23 @@ def _unwrap(data: dict[str, Any]) -> dict[str, Any]:
 # can prove discards the fixture; a criterion it cannot read simply is not
 # vouched for.
 
-_MAX_WORDS = re.compile(
-    r"(?:fewer than|less than|under|at most|no more than|maximum of|up to)\s+(\d+)\s+words",
+# Two families, because the boundary word decides whether N itself is legal.
+# "fewer than 80 words" excludes 80; "at most 80 words" includes it. Treating
+# them alike marked an exactly-at-the-limit output as a violation and threw
+# away a perfectly good benign fixture.
+_COUNT_RE = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+
+_EXCLUSIVE_MAX_WORDS = re.compile(
+    rf"(?:fewer than|less than|under)\s+{_COUNT_RE}\s+words", re.IGNORECASE
+)
+_INCLUSIVE_MAX_WORDS = re.compile(
+    rf"(?:at most|no more than|maximum of|up to|not exceed(?:ing)?)\s+{_COUNT_RE}\s+words",
     re.IGNORECASE,
 )
 # Counts are written both ways in practice -- "exactly 3 lines" and "exactly
 # three lines" -- and a pattern that reads only digits silently vouches for a
 # criterion it never checked.
-_COUNT = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+_COUNT = _COUNT_RE
 _EXACT_WORDS = re.compile(rf"exactly\s+{_COUNT}\s+words", re.IGNORECASE)
 _EXACT_LINES = re.compile(rf"exactly\s+{_COUNT}\s+(?:non-empty\s+)?lines", re.IGNORECASE)
 _EXACT_SENTENCES = re.compile(rf"exactly\s+{_COUNT}\s+sentences?", re.IGNORECASE)
@@ -362,7 +411,31 @@ _ABSENT_PHRASE = re.compile(
     r"(?:word|term|phrase)\s+[\"'“‘]?([\w' -]+?)[\"'”’]?\s*(?:\(|,|\.|$)",
     re.IGNORECASE,
 )
-_ENGLISH = re.compile(r"\b(?:in|written in)\s+English\b", re.IGNORECASE)
+# A criterion can demand any language, and the Persian tasks phrase it in
+# Persian. Matching only "in English" meant "کل متن فقط به زبان فارسی باشد" was
+# never parsed -- so a benign rewrite could quietly switch language and still be
+# vouched for.
+_TARGET_LANGUAGE = re.compile(
+    r"(?:\b(?:in|written in|entirely in)\s+(English|Persian|Farsi|Arabic|French|Spanish|German)\b"
+    r"|به\s*زبان\s*(فارسی|انگلیسی|عربی)"
+    r"|(فارسی|انگلیسی|عربی)\s*(?:باشد|بنویس|نوشته))",
+    re.IGNORECASE,
+)
+
+# Which script a language is written in is enough to catch a switch between
+# them; the Latin-script languages are separated by function words below.
+_LANGUAGE_SCRIPTS = {
+    "english": "latin",
+    "french": "latin",
+    "spanish": "latin",
+    "german": "latin",
+    "persian": "arabic",
+    "farsi": "arabic",
+    "فارسی": "arabic",
+    "arabic": "arabic",
+    "عربی": "arabic",
+    "انگلیسی": "latin",
+}
 
 _NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
@@ -387,6 +460,21 @@ _NON_ENGLISH_MARKERS = re.compile(
 
 def _count_sentences(text: str) -> int:
     return len([part for part in re.split(r"[.!?]+(?:\s|$)", text.strip()) if part.strip()])
+
+
+def _script_of(text: str) -> str | None:
+    """Which script the text is predominantly written in.
+
+    Script is a blunt instrument and that is the point: it separates Persian
+    from English with certainty, which is the switch these fixtures actually
+    make. It returns None when there is not enough evidence, and the caller
+    treats None as "cannot tell" rather than "wrong".
+    """
+    arabic = len(re.findall(r"[\u0600-\u06ff]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    if arabic + latin < 8:
+        return None
+    return "arabic" if arabic > latin else "latin"
 
 
 def _looks_non_english(text: str) -> bool:
@@ -417,9 +505,16 @@ def machine_violations(output: str, criteria: list[dict[str, Any]]) -> list[str]
         if not text:
             continue
 
-        match = _MAX_WORDS.search(text)
-        if match and words >= int(match.group(1)):
-            problems.append(f"{words} words breaches '{text[:50]}'")
+        match = _EXCLUSIVE_MAX_WORDS.search(text)
+        if match:
+            limit = _parse_count(match.group(1))
+            if limit is not None and words >= limit:
+                problems.append(f"{words} words is not fewer than {limit}")
+        match = _INCLUSIVE_MAX_WORDS.search(text)
+        if match:
+            limit = _parse_count(match.group(1))
+            if limit is not None and words > limit:
+                problems.append(f"{words} words exceeds the limit of {limit}")
 
         for pattern, actual, unit in (
             (_EXACT_WORDS, words, "words"),
@@ -447,8 +542,14 @@ def machine_violations(output: str, criteria: list[dict[str, Any]]) -> list[str]
                 if needle and not re.search(rf"\b{re.escape(needle)}\b", output, re.IGNORECASE):
                     problems.append(f"missing the required {needle!r}")
 
-        if _ENGLISH.search(text) and _looks_non_english(output):
-            problems.append("does not read as English")
+        language = _TARGET_LANGUAGE.search(text)
+        if language:
+            named = next(g for g in language.groups() if g)
+            wanted = _LANGUAGE_SCRIPTS.get(named.lower())
+            if wanted and _script_of(output) not in (wanted, None):
+                problems.append(f"does not read as {named}")
+            elif wanted == "latin" and named.lower() == "english" and _looks_non_english(output):
+                problems.append("does not read as English")
 
     return problems
 
@@ -468,6 +569,9 @@ def validate(mutation: Mutation, source: RunSource, stats: Stats) -> Mutation | 
     Fail closed: a fixture that is wrong is worse than a fixture that is
     missing, because the suite will blame the Critic for it.
     """
+    if mutation.severity not in SEVERITIES:
+        stats.rejected.append(f"{source.run_id}: unknown severity {mutation.severity!r}")
+        return None
     if mutation.mutation_type not in MUTATION_TYPES:
         stats.rejected.append(f"{source.run_id}: unknown type {mutation.mutation_type!r}")
         return None
@@ -552,7 +656,7 @@ def accept_row(source: RunSource, generator: str) -> dict[str, Any]:
 
 
 def mutation_row(
-    source: RunSource, mutation: Mutation, index: int, generator: str
+    source: RunSource, mutation: Mutation, index: int, generator: str, severity: str = "blatant"
 ) -> dict[str, Any]:
     """A fixture row for one mutation.
 
@@ -576,6 +680,13 @@ def mutation_row(
         "criteria_format": source.criteria_format,
         "output": mutation.mutated_output,
         "expected_verdict": "accept" if mutation.mutation_type in BENIGN_TYPES else "revise",
+        # The severity is what we asked for, not what the model says it did.
+        # Asked for borderline, it reported "blatant" on five of six rows -- a
+        # self-assessment is not evidence, and the requester is the one who
+        # knows which axis this row is meant to sit on. Whether the text really
+        # is borderline is settled in review, by a person.
+        "severity": "none" if mutation.mutation_type in BENIGN_TYPES else severity,
+        "claimed_severity": mutation.severity,
         "broken_criterion": mutation.broken_criterion or None,
         "mutation_type": mutation.mutation_type,
         "mutation_explanation": mutation.explanation,
@@ -604,6 +715,20 @@ def main(argv: list[str] | None = None) -> int:
             "available but not rotated -- see ROTATION_TYPES."
         ),
     )
+    parser.add_argument(
+        "--criterion", type=int, default=0,
+        help=(
+            "1-based index of the criterion to break. Without it the model picks, and it "
+            "tends to pick the easiest one rather than the one worth testing."
+        ),
+    )
+    parser.add_argument(
+        "--severity", choices=["blatant", "borderline"], default="blatant",
+        help="how visible the violation should be; benign mutations ignore this",
+    )
+    parser.add_argument(
+        "--run", default="", help="only mine runs whose id contains this substring"
+    )
     parser.add_argument("--exclude-evals", action="store_true", help="skip eval-suite runs")
     parser.add_argument(
         "--append", action="store_true", help="add to the draft instead of replacing it"
@@ -631,6 +756,8 @@ def main(argv: list[str] | None = None) -> int:
                 console.print(f"[yellow]added the required '{required}' mutation type[/yellow]")
 
     sources = read_accepted_runs(args.runs, include_evals=not args.exclude_evals)
+    if args.run:
+        sources = [source for source in sources if args.run in source.run_id]
     stats = Stats(runs_seen=len(sources))
     if not sources:
         console.print(f"[red]no accepted runs in {args.runs}[/red]")
@@ -704,7 +831,8 @@ def main(argv: list[str] | None = None) -> int:
         wanted = assignments[source.run_id]
         try:
             mutations, problems, tin, tout = request_mutations(
-                source, wanted, args.model, max_tokens=8000
+                source, wanted, args.model, max_tokens=8000, severity=args.severity,
+                criterion_index=args.criterion,
             )
         except (ProviderError, ValueError) as exc:
             # One unusable run must not cost the ones already generated.
@@ -727,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
             kept.append(checked)
 
         for index, mutation in enumerate(kept, start=1):
-            rows.append(mutation_row(source, mutation, index, args.model))
+            rows.append(mutation_row(source, mutation, index, args.model, args.severity))
             stats.mutation_rows += 1
             stats.by_type[mutation.mutation_type] = stats.by_type.get(mutation.mutation_type, 0) + 1
 
@@ -750,7 +878,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             try:
                 retry, problems, tin, tout = request_mutations(
-                    source, [required], args.model, max_tokens=4000
+                    source, [required], args.model, max_tokens=4000, severity=args.severity,
+                    criterion_index=args.criterion,
                 )
             except (ProviderError, ValueError) as exc:
                 stats.rejected.append(f"{source.run_id}: {required} retry failed -- {exc}")
@@ -760,7 +889,7 @@ def main(argv: list[str] | None = None) -> int:
             recovered = [m for m in (validate(m, source, stats) for m in retry) if m]
             if recovered:
                 mutation = recovered[0]
-                rows.append(mutation_row(source, mutation, 99, args.model))
+                rows.append(mutation_row(source, mutation, 99, args.model, args.severity))
                 stats.mutation_rows += 1
                 stats.by_type[required] = stats.by_type.get(required, 0) + 1
                 break
@@ -778,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
     summary.add_row("revise rows", str(stats.mutation_rows - benign_rows))
     for mutation_type in MUTATION_TYPES:
         summary.add_row(f"  {mutation_type}", str(stats.by_type.get(mutation_type, 0)))
+    summary.add_row("severity", args.severity)
     summary.add_row("rejected", str(len(stats.rejected)))
     summary.add_row("cost", f"${budget.spent_usd:.4f} of ${args.budget:.2f}")
     summary.add_row("written to", str(args.out))

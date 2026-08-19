@@ -54,6 +54,7 @@ class Outcome:
     fixture_id: str
     expected: str
     mutation_type: str | None
+    severity: str | None = None
     accepted: bool | None = None
     correct: bool = False
     caught_named_criterion: bool | None = None
@@ -109,43 +110,24 @@ def as_plan(row: dict[str, Any]) -> ManagerPlan:
 def is_correct(expected: str, accepted: bool) -> bool:
     """Did the Critic agree with the fixture?
 
-    Pulled out of the loop so it can be tested without spending anything, and
-    so the negative control below exercises the same rule the real run uses.
+    Pulled out of the loop so it can be tested without spending anything: the
+    offline negative control in self_check drives this exact rule.
     """
     return accepted if expected == "accept" else not accepted
-
-
-def invert(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Flip every fixture's expected verdict, for the negative control.
-
-    A suite that reports 100% is either measuring a good judge or measuring
-    nothing. Inverting the ground truth separates the two: the same fixtures,
-    the same code path, an answer key that is now wrong everywhere. If the
-    score does not collapse, the harness is scoring itself rather than the
-    Critic.
-
-    Benign rows invert to "revise" and broken rows to "accept", which is what
-    makes this a control rather than a second opinion.
-    """
-    flipped = []
-    for row in rows:
-        copy = dict(row)
-        copy["expected_verdict"] = "revise" if row["expected_verdict"] == "accept" else "accept"
-        flipped.append(copy)
-    return flipped
 
 
 def grade_outcome(row: dict[str, Any], verdict: CriticVerdict) -> Outcome:
     """Score one verdict against one fixture. Pure: no network, no budget.
 
     Kept separate from ``judge`` so the scoring rule can be exercised with a
-    hand-built ``CriticVerdict`` -- which is how the negative control runs on
-    every gate without an API key or a cent of spend.
+    hand-built ``CriticVerdict`` -- which is how the negative control in
+    self_check runs on every gate without an API key or a cent of spend.
     """
     outcome = Outcome(
         fixture_id=row["fixture_id"],
         expected=row["expected_verdict"],
         mutation_type=row.get("mutation_type"),
+        severity=row.get("severity"),
     )
     outcome.accepted = verdict.accepted
     outcome.score = verdict.score
@@ -221,6 +203,35 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
         )
     console.print(table)
 
+    # Severity is the axis that separates a judge from a keyword matcher.
+    # Catching "walking cures diabetes" says almost nothing; catching "walking
+    # can help with blood sugar control" is the whole question. Averaging the
+    # two hides exactly the number worth knowing.
+    labelled = [o for o in revises if o.severity in {"blatant", "borderline"}]
+    if labelled:
+        severity_table = Table(title="Rejection rate by severity", header_style="bold")
+        severity_table.add_column("Severity")
+        severity_table.add_column("Caught", justify="right")
+        severity_table.add_column("Rate", justify="right")
+        severity_table.add_column("Right criterion", justify="right")
+        for level in ("blatant", "borderline"):
+            items = [o for o in labelled if o.severity == level]
+            if not items:
+                continue
+            caught = sum(o.correct for o in items)
+            named = [o for o in items if o.caught_named_criterion is not None]
+            right = sum(bool(o.caught_named_criterion) for o in named)
+            severity_table.add_row(
+                level,
+                f"{caught}/{len(items)}",
+                f"{caught / len(items):.0%}",
+                f"{right}/{len(named)}" if named else "—",
+            )
+        unlabelled = len(revises) - len(labelled)
+        if unlabelled:
+            severity_table.add_row("(unlabelled)", f"—/{unlabelled}", "—", "—")
+        console.print(severity_table)
+
     misses = [o for o in ran if not o.correct]
     if misses:
         detail = Table(title="Misses", header_style="bold")
@@ -259,6 +270,14 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
             }
             for k, v in by_type.items()
         },
+        "by_severity": {
+            level: {
+                "cases": len([o for o in revises if o.severity == level]),
+                "caught": sum(o.correct for o in revises if o.severity == level),
+            }
+            for level in ("blatant", "borderline")
+            if any(o.severity == level for o in revises)
+        },
         "errors": len(report.errors),
         "cost_usd": round(budget.spent_usd, 6),
         "elapsed_s": round(elapsed, 2),
@@ -272,10 +291,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=float, default=0.50)
     parser.add_argument("--out", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--include-unreviewed", action="store_true")
-    parser.add_argument(
-        "--negative-control", action="store_true",
-        help="invert every expected verdict; the run must then score zero",
-    )
     parser.add_argument("--limit", type=int, default=0, help="judge only the first N fixtures")
     parser.add_argument(
         "--delay", type=float, default=4.0,
@@ -299,13 +314,6 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         console.print("[red]no reviewed fixtures to run[/red]")
         return 1
-
-    if args.negative_control:
-        rows = invert(rows)
-        console.print(
-            "[yellow]negative control: every expected verdict is inverted. "
-            "A correct harness scores 0% here.[/yellow]"
-        )
 
     accepts = sum(1 for r in rows if r["expected_verdict"] == "accept")
     console.print(
@@ -348,8 +356,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    prefix = "critic-negative-control" if args.negative_control else "critic"
-    out_path = args.out / f"{prefix}-{stamp}.json"
+    out_path = args.out / f"critic-{stamp}.json"
     out_path.write_text(
         json.dumps(
             {
@@ -363,21 +370,6 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     console.print(f"report: {out_path}")
-
-    if args.negative_control:
-        judged = [o for o in report.outcomes if not o.error]
-        agreed = sum(o.correct for o in judged)
-        if agreed:
-            # Under an inverted key, "correct" means the Critic disagreed with
-            # the real fixture -- so these are the cases it genuinely got wrong
-            # in the normal run, not evidence that the harness is broken.
-            console.print(
-                f"[yellow]{agreed}/{len(judged)} still scored correct under the inverted key; "
-                "those are the fixtures the Critic gets wrong in a normal run[/yellow]"
-            )
-        else:
-            console.print("[green]negative control passed: the score collapsed to 0%[/green]")
-        return 0 if not report.errors else 1
 
     return 0 if not report.errors else 1
 

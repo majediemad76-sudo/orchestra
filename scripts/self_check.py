@@ -707,6 +707,24 @@ def check_critic_harness() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
     import eval_critic as ec
 
+    def invert(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flip every expected verdict. Defined here, and only here.
+
+        This used to live in eval_critic with a --negative-control flag, which
+        meant the live harness could be pointed at the real Critic with a
+        deliberately wrong answer key: real money, a report file that looks
+        like a genuine evaluation, and every row marked wrong on purpose.
+        Inverting is a property of the *test*, not of the tool, so it stays in
+        the test.
+        """
+        return [
+            {
+                **row,
+                "expected_verdict": "revise" if row["expected_verdict"] == "accept" else "accept",
+            }
+            for row in rows
+        ]
+
     check(ec.is_correct("accept", accepted=True), "accept fixture + accepted = correct")
     check(not ec.is_correct("accept", accepted=False), "accept fixture + rejected = wrong")
     check(ec.is_correct("revise", accepted=False), "revise fixture + rejected = correct")
@@ -754,7 +772,7 @@ def check_critic_harness() -> None:
     )
 
     # The same verdicts against an inverted key must all be marked wrong.
-    flipped = ec.invert([good, broken])
+    flipped = invert([good, broken])
     check(
         [f["expected_verdict"] for f in flipped] == ["revise", "accept"],
         "invert() flips every expected verdict",

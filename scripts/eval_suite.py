@@ -107,6 +107,22 @@ def load_tasks(path: Path, only: list[str], grading: str = "auto") -> list[dict[
     return tasks
 
 
+# Every status run_task can end on, plus the wildcard. A task expecting
+# anything outside this set is a typo, and a typo that happens to prefix a real
+# status would pass silently for as long as nobody read the file.
+KNOWN_STATUSES = frozenset(
+    {
+        "accepted",
+        "accepted_by_user",
+        "stopped_by_user",
+        "stopped_by_flag",
+        "escalated_unanswered",
+        "max_rounds",
+        "crashed",
+    }
+)
+
+
 def grade(spec: dict[str, Any], summary: dict[str, Any]) -> list[str]:
     """Check a finished run against the task's expectations.
 
@@ -114,32 +130,59 @@ def grade(spec: dict[str, Any], summary: dict[str, Any]) -> list[str]:
     itself on the Critic's score alone would report a perfect run whenever the
     Critic was simply wrong -- the same self-verification trap the Critic is
     a separate vendor to avoid.
+
+    A task that asserts nothing fails. This used to be the quiet hole in the
+    benchmark: ``expect_status: "any"`` skips the status check, ``min_score:
+    0`` is falsy and skips the score check, and with no substrings left the
+    function returned an empty failure list -- a pass, from zero checks
+    performed. Counting that as a pass makes the headline number mean less than
+    it appears to. Manual tasks are exempt: a person reads those.
     """
     failures: list[str] = []
+    checks_performed = 0
 
     expected_status = spec.get("expect_status", "accepted")
-    if expected_status != "any" and not summary["status"].startswith(expected_status):
-        failures.append(f"status {summary['status']} != {expected_status}")
+    if expected_status not in KNOWN_STATUSES and expected_status != "any":
+        failures.append(
+            f"expect_status {expected_status!r} is not a status run_task can produce"
+        )
+    elif expected_status != "any":
+        checks_performed += 1
+        # Exact, not startswith: "accept" silently matching "accepted" and
+        # "accepted_by_user" hides the difference between the Critic accepting
+        # and a human waving it through.
+        if summary["status"] != expected_status:
+            failures.append(f"status {summary['status']} != {expected_status}")
 
     # Acceptance is binary now, so min_score is no longer a duplicate of the
     # accept rule -- it measures *how much* of the criteria set held up, which
     # is the interesting number when a task fails.
     min_score = spec.get("min_score")
-    if min_score:
-        score = summary.get("score")
-        if score is None:
-            failures.append("no score produced")
-        elif score < min_score:
-            failures.append(f"score {score} < {min_score}")
+    if min_score is not None:
+        if min_score <= 0:
+            failures.append("min_score 0 checks nothing -- drop the key or raise it")
+        else:
+            checks_performed += 1
+            score = summary.get("score")
+            if score is None:
+                failures.append("no score produced")
+            elif score < min_score:
+                failures.append(f"score {score} < {min_score}")
 
     text = (summary.get("result") or "").lower()
     for needle in spec.get("expect_substrings", []):
+        checks_performed += 1
         if needle.lower() not in text:
             failures.append(f"missing {needle!r}")
 
     max_cost = spec.get("max_cost_usd")
-    if max_cost and summary["budget"]["spent_usd"] > max_cost:
-        failures.append(f"cost ${summary['budget']['spent_usd']:.4f} > ${max_cost:.2f}")
+    if max_cost:
+        checks_performed += 1
+        if summary["budget"]["spent_usd"] > max_cost:
+            failures.append(f"cost ${summary['budget']['spent_usd']:.4f} > ${max_cost:.2f}")
+
+    if not checks_performed and spec.get("grading", "auto") != "manual":
+        failures.append("this task asserts nothing -- a pass here would be meaningless")
 
     return failures
 
