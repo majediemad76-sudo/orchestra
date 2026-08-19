@@ -11,10 +11,12 @@ SOURCES := $(shell find . -name '*.py' -not -path './.venv/*')
 # Small enough to be honest about, large enough to finish a short task.
 RUN_BUDGET ?= 0.10
 RUN_ROUNDS ?= 2
+# Ceiling for the whole eval suite, not per task.
+EVAL_BUDGET ?= 1.00
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check lint run ui clean distclean
+.PHONY: help venv install test check lint run ui eval clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -41,10 +43,14 @@ run: ## Live smoke run against the real APIs -- costs money, needs .env
 ui: ## Launch the Streamlit observer UI
 	./.venv/bin/streamlit run app.py
 
+eval: ## Run the eval suite against the live APIs -- costs money, needs .env
+	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
+	$(PY) scripts/eval_suite.py --budget $(EVAL_BUDGET)
+
 clean: ## Remove bytecode caches and self-check run logs
 	@find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} +
 	@find . -name '*.pyc' -not -path './.venv/*' -delete
-	@rm -f runs/selfcheck-*.jsonl
+	@rm -f runs/selfcheck-*.jsonl runs/eval-*.jsonl
 	@echo "cleaned (real run logs in runs/ were kept)"
 
 distclean: clean ## Also delete every run log and the virtualenv

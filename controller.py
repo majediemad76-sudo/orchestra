@@ -46,7 +46,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from budget import BudgetGuard
+from budget import API_BILLED, SUBSCRIPTION_EQUIVALENT, BudgetGuard
 from roles import critic as critic_role
 from roles import manager as manager_role
 from roles import worker as worker_role
@@ -137,19 +137,19 @@ def ask_on_console(question: Question) -> Optional[int]:
     that silently picks option 1 in CI is worse than one that halts and says
     what it was about to ask.
     """
-    console.print(Panel(question.text, title="ارجاع به کاربر", border_style="yellow"))
+    console.print(Panel(question.text, title="Escalation", border_style="yellow"))
     for index, option in enumerate(question.options, start=1):
         console.print(f"  [bold]{index}[/bold]. {option}")
     if not sys.stdin.isatty():
         console.print("[yellow]stdin is not interactive; stopping with the question open.[/yellow]")
         return None
     while True:
-        raw = input("انتخاب شما (شماره، یا خالی برای توقف): ").strip()
+        raw = input("Your choice (number, or blank to stop): ").strip()
         if not raw:
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(question.options):
             return int(raw) - 1
-        console.print("[red]شماره‌ی نامعتبر.[/red]")
+        console.print("[red]Not a valid option number.[/red]")
 
 
 def _asker_from_escalation(on_escalation: EscalationFn) -> AnswerFn:
@@ -291,7 +291,7 @@ def run_task(
             break
 
         state.round += 1
-        console.rule(f"دور {state.round} / {task.max_rounds}")
+        console.rule(f"Round {state.round} / {task.max_rounds}")
         emit(
             "round_start",
             {
@@ -310,12 +310,12 @@ def run_task(
                 state,
                 log,
                 "budget_exceeded",
-                f"سقف بودجه ({state.budget.limit_usd:.2f}$) رد شد؛ "
-                f"تاکنون {state.budget.spent_usd:.4f}$ خرج شده. چه کار کنم؟",
+                f"The budget ceiling (${state.budget.limit_usd:.2f}) was crossed; "
+                f"${state.budget.spent_usd:.4f} spent so far. How should I proceed?",
                 [
-                    ("سقف بودجه را دو برابر کن و ادامه بده", RAISE_BUDGET),
-                    ("بهترین خروجی فعلی را بپذیر و تمام کن", ACCEPT_BEST),
-                    ("همین‌جا متوقف شو", STOP),
+                    ("Double the ceiling and keep going", RAISE_BUDGET),
+                    ("Accept the best output so far and finish", ACCEPT_BEST),
+                    ("Stop here", STOP),
                 ],
                 ask,
             )
@@ -347,11 +347,12 @@ def run_task(
             round=state.round,
             plan=plan.model_dump(),
             cost_usd=entry.cost_usd,
+            cost_basis=API_BILLED,
             model=entry.model,
             input_tokens=entry.input_tokens,
             output_tokens=entry.output_tokens,
         )
-        console.print(Panel(plan.plan, title=f"نقشه‌ی Manager ({plan.worker_type})", border_style="cyan"))
+        console.print(Panel(plan.plan, title=f"Manager plan ({plan.worker_type})", border_style="cyan"))
         emit(
             "manager_plan",
             {
@@ -372,7 +373,7 @@ def run_task(
         if plan.needs_user_input and plan.question is not None:
             options = list(plan.question.options)[:4]
             while len(options) < 2:
-                options.append("خودت بهترین حدس را بزن و ادامه بده")
+                options.append("Make your best assumption and continue")
             action, label = _escalate(
                 state,
                 log,
@@ -394,11 +395,16 @@ def run_task(
         # --- Worker --------------------------------------------------------
         run = worker_role.execute(plan, cwd=cwd)
         if run.cost_usd is not None:
+            # Only Claude Code headless reports dollars directly, and on a
+            # personal subscription that figure is API-equivalent rather than
+            # billed. See providers/claude_code.py.
             entry = state.budget.charge_usd(f"round{state.round}.worker", run.model, run.cost_usd)
+            cost_basis = SUBSCRIPTION_EQUIVALENT
         else:
             entry = state.budget.charge(
                 f"round{state.round}.worker", run.model, run.input_tokens, run.output_tokens
             )
+            cost_basis = API_BILLED
         state.output = run.output
         log.write(
             "worker_output",
@@ -409,6 +415,7 @@ def run_task(
             notes=run.output.notes,
             failure_reason=run.failure_reason,
             cost_usd=entry.cost_usd,
+            cost_basis=cost_basis,
             model=entry.model,
         )
         emit(
@@ -421,6 +428,7 @@ def run_task(
                 "notes": run.output.notes,
                 "failure_reason": run.failure_reason,
                 "cost_usd": entry.cost_usd,
+                "cost_basis": cost_basis,
                 "model": entry.model,
             },
         )
@@ -430,7 +438,14 @@ def run_task(
             # No output to grade: synthesise the rejection instead of paying
             # the Critic to state the obvious.
             verdict = critic_role.failed_worker_verdict(run.failure_reason or "worker failed")
-            log.write("critic_verdict", round=state.round, verdict=verdict.model_dump(), cost_usd=0.0, synthetic=True)
+            log.write(
+                "critic_verdict",
+                round=state.round,
+                verdict=verdict.model_dump(),
+                cost_usd=0.0,
+                cost_basis=API_BILLED,
+                synthetic=True,
+            )
         else:
             verdict, critic_call = critic_role.review(plan, run.output)
             entry = state.budget.charge(
@@ -444,13 +459,14 @@ def run_task(
                 round=state.round,
                 verdict=verdict.model_dump(),
                 cost_usd=entry.cost_usd,
+                cost_basis=API_BILLED,
                 model=entry.model,
             )
         state.verdict = verdict
         console.print(
             Panel(
                 f"score={verdict.score}  verdict={verdict.verdict}\n{verdict.fix_instruction}",
-                title="نظر Critic",
+                title="Critic verdict",
                 border_style="magenta" if verdict.verdict != "accept" else "green",
             )
         )
@@ -487,13 +503,13 @@ def run_task(
                 state,
                 log,
                 "two_rejections",
-                "دو دور پیاپی رد شد. آخرین ایراد: "
-                + (verdict.fix_instruction or ", ".join(verdict.failed_criteria) or "نامشخص"),
+                "Two rounds were rejected in a row. Latest problem: "
+                + (verdict.fix_instruction or ", ".join(verdict.failed_criteria) or "unspecified"),
                 [
-                    ("همان مسیر را با اصلاح پیشنهادی Critic ادامه بده", CONTINUE),
-                    ("معیارهای پذیرش را ساده‌تر کن و دوباره تلاش کن", CONTINUE),
-                    ("بهترین خروجی فعلی را بپذیر و تمام کن", ACCEPT_BEST),
-                    ("همین‌جا متوقف شو", STOP),
+                    ("Keep this approach and apply the Critic's fix", CONTINUE),
+                    ("Loosen the acceptance criteria and retry", CONTINUE),
+                    ("Accept the best output so far and finish", ACCEPT_BEST),
+                    ("Stop here", STOP),
                 ],
                 ask,
             )
@@ -524,7 +540,7 @@ def run_task(
 
 
 def print_summary(summary: Dict[str, Any]) -> None:
-    table = Table(title="خلاصه‌ی اجرا", show_header=False)
+    table = Table(title="Run summary", show_header=False)
     table.add_row("status", str(summary["status"]))
     table.add_row("rounds", str(summary["rounds"]))
     table.add_row("score", str(summary["score"]))
@@ -532,7 +548,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
     table.add_row("log", summary["log_path"])
     console.print(table)
     if summary["result"]:
-        console.print(Panel(summary["result"][:4000], title="خروجی", border_style="green"))
+        console.print(Panel(summary["result"][:4000], title="Output", border_style="green"))
 
 
 def main(argv: Optional[List[str]] = None) -> int:

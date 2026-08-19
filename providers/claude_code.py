@@ -118,6 +118,15 @@ def run(
             error="stdout was not the expected JSON envelope",
         )
 
+    # What `total_cost_usd` actually is, because the name invites a wrong read:
+    # it is what this session WOULD have cost at API rates. On a personal Claude
+    # subscription (Pro/Max) the CLI runs against the plan's included usage --
+    # nothing here is drawn from API credit and no invoice line appears for it.
+    # So it is a real measure of work done and a real input to the budget
+    # ceiling, but it is not money billed. Runs that mix this worker with the
+    # API roles therefore add two different kinds of spend, which is why every
+    # charge is tagged with a cost_basis in the run log.
+    # (On an API-key-authenticated CLI the same figure IS billed usage.)
     return CodeResult(
         ok=not body.get("is_error", False),
         result=str(body.get("result", "")),

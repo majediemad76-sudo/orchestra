@@ -1,0 +1,6 @@
+{"id": "summary-short", "goal": "Write a two-sentence summary of what a multi-model orchestrator does.", "max_rounds": 2, "budget_usd": 0.10, "min_score": 80, "expect_status": "accepted", "expect_substrings": ["orchestrat"]}
+{"id": "constrained-length", "goal": "Explain prompt caching in under 60 words, with no bullet points and no jargon.", "max_rounds": 3, "budget_usd": 0.15, "min_score": 80, "expect_status": "accepted"}
+{"id": "structured-list", "goal": "List exactly three risks of letting a model decide its own retry budget. One line each, no preamble.", "max_rounds": 3, "budget_usd": 0.15, "min_score": 80, "expect_status": "accepted"}
+{"id": "refusal-of-taste", "goal": "Rewrite this sentence to be clearer: 'The thing that the system does is it takes the task and then it does the task.'", "max_rounds": 2, "budget_usd": 0.10, "min_score": 80, "expect_status": "accepted"}
+{"id": "hard-constraint", "goal": "Write a haiku about deterministic control loops. Exactly three lines, 5-7-5 syllables.", "max_rounds": 3, "budget_usd": 0.15, "min_score": 75, "expect_status": "accepted"}
+{"id": "underspecified", "goal": "Write the announcement post.", "max_rounds": 2, "budget_usd": 0.10, "min_score": 0, "expect_status": "any", "note": "Deliberately underspecified: the Manager should ask rather than invent. Any non-crash outcome passes."}

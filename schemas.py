@@ -44,7 +44,7 @@ class Task(BaseModel):
     goal: str = Field(description="What the user wants.")
     context: str = Field(default="", description="Any extra context supplied by the user.")
     max_rounds: int = Field(default=4, ge=1, description="Hard cap on Manager/Worker/Critic rounds.")
-    budget_usd: float = Field(default=1.0, gt=0, description="Dollar ceiling for the whole run.")
+    budget_usd: float = Field(default=0.50, gt=0, description="Dollar ceiling for the whole run.")
     accept_score: int = Field(default=80, ge=0, le=100, description="Critic score needed to accept.")
 
 

@@ -15,6 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
+# How a charge was actually incurred. Both are real spend; they are not the
+# same kind of spend, and a log that blurs them cannot answer "what did this
+# run put on the API bill?".
+API_BILLED = "api_billed"
+SUBSCRIPTION_EQUIVALENT = "subscription_equivalent"
+
 PRICING: Dict[str, Tuple[float, float]] = {
     # model: (input $/1M, output $/1M)
     "claude-sonnet-5": (2.00, 10.00),

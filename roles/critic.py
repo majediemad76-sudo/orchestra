@@ -77,8 +77,8 @@ def failed_worker_verdict(reason: str) -> CriticVerdict:
         met_criteria=[],
         failed_criteria=["worker produced no usable output"],
         fix_instruction=(
-            "کار را به گام‌های کوچک‌تر بشکن و دستور را کوتاه‌تر و مشخص‌تر کن. "
-            f"علت شکست دور قبل: {reason}"
+            "Break the task into smaller steps and make the instruction shorter and "
+            f"more specific. The previous round failed because: {reason}"
         ),
         verdict="revise",
     )
