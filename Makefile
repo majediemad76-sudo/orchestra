@@ -14,7 +14,7 @@ RUN_ROUNDS ?= 2
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check lint run clean distclean
+.PHONY: help venv install test check lint run ui clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -37,6 +37,9 @@ lint: ## Byte-compile every source file
 run: ## Live smoke run against the real APIs -- costs money, needs .env
 	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
 	$(PY) controller.py "$(GOAL)" --budget $(RUN_BUDGET) --max-rounds $(RUN_ROUNDS)
+
+ui: ## Launch the Streamlit observer UI
+	./.venv/bin/streamlit run app.py
 
 clean: ## Remove bytecode caches and self-check run logs
 	@find . -name '__pycache__' -type d -not -path './.venv/*' -prune -exec rm -rf {} +
