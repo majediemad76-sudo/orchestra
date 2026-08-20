@@ -55,6 +55,7 @@ class Outcome:
     expected: str
     mutation_type: str | None
     severity: str | None = None
+    broken_criterion: str | None = None
     accepted: bool | None = None
     correct: bool = False
     caught_named_criterion: bool | None = None
@@ -128,6 +129,7 @@ def grade_outcome(row: dict[str, Any], verdict: CriticVerdict) -> Outcome:
         expected=row["expected_verdict"],
         mutation_type=row.get("mutation_type"),
         severity=row.get("severity"),
+        broken_criterion=row.get("broken_criterion"),
     )
     outcome.accepted = verdict.accepted
     outcome.score = verdict.score
@@ -232,6 +234,30 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
             severity_table.add_row("(unlabelled)", f"—/{unlabelled}", "—", "—")
         console.print(severity_table)
 
+    # Per criterion, because an aggregate hides which *kind* of rule the judge
+    # is soft on. A Critic can be perfect on word counts and blind to implied
+    # health claims, and the headline number reads the same either way.
+    by_criterion: dict[str, list[Outcome]] = defaultdict(list)
+    for outcome in revises:
+        if outcome.broken_criterion:
+            by_criterion[outcome.broken_criterion].append(outcome)
+    if by_criterion:
+        criterion_table = Table(title="Rejection rate by criterion", header_style="bold")
+        criterion_table.add_column("Criterion", max_width=54)
+        criterion_table.add_column("Caught", justify="right")
+        criterion_table.add_column("Blatant", justify="right")
+        criterion_table.add_column("Borderline", justify="right")
+        for criterion, items in sorted(by_criterion.items(), key=lambda kv: -len(kv[1])):
+            blatant = [o for o in items if o.severity == "blatant"]
+            borderline = [o for o in items if o.severity == "borderline"]
+            criterion_table.add_row(
+                criterion,
+                f"{sum(o.correct for o in items)}/{len(items)}",
+                f"{sum(o.correct for o in blatant)}/{len(blatant)}" if blatant else "—",
+                f"{sum(o.correct for o in borderline)}/{len(borderline)}" if borderline else "—",
+            )
+        console.print(criterion_table)
+
     misses = [o for o in ran if not o.correct]
     if misses:
         detail = Table(title="Misses", header_style="bold")
@@ -277,6 +303,17 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
             }
             for level in ("blatant", "borderline")
             if any(o.severity == level for o in revises)
+        },
+        "by_criterion": {
+            criterion: {
+                "cases": len(items),
+                "caught": sum(o.correct for o in items),
+                "borderline_cases": len([o for o in items if o.severity == "borderline"]),
+                "borderline_caught": sum(
+                    o.correct for o in items if o.severity == "borderline"
+                ),
+            }
+            for criterion, items in by_criterion.items()
         },
         "errors": len(report.errors),
         "cost_usd": round(budget.spent_usd, 6),
