@@ -656,7 +656,12 @@ def accept_row(source: RunSource, generator: str) -> dict[str, Any]:
 
 
 def mutation_row(
-    source: RunSource, mutation: Mutation, index: int, generator: str, severity: str = "blatant"
+    source: RunSource,
+    mutation: Mutation,
+    index: int,
+    generator: str,
+    severity: str = "blatant",
+    cohort: str = "tuned",
 ) -> dict[str, Any]:
     """A fixture row for one mutation.
 
@@ -686,6 +691,9 @@ def mutation_row(
         # knows which axis this row is meant to sit on. Whether the text really
         # is borderline is settled in review, by a person.
         "severity": "none" if mutation.mutation_type in BENIGN_TYPES else severity,
+        # Recorded per row, not counted by hand afterwards: a split that lives
+        # only in someone's head cannot be reproduced next time.
+        "cohort": cohort,
         "claimed_severity": mutation.severity,
         "broken_criterion": mutation.broken_criterion or None,
         "mutation_type": mutation.mutation_type,
@@ -720,6 +728,14 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "1-based index of the criterion to break. Without it the model picks, and it "
             "tends to pick the easiest one rather than the one worth testing."
+        ),
+    )
+    parser.add_argument(
+        "--cohort", default="tuned",
+        help=(
+            "which population this fixture belongs to. 'tuned' means it existed while the "
+            "Critic prompt was being written; 'holdout' means it did not, and is therefore "
+            "the only kind that measures generalisation rather than regression."
         ),
     )
     parser.add_argument(
@@ -855,7 +871,9 @@ def main(argv: list[str] | None = None) -> int:
             kept.append(checked)
 
         for index, mutation in enumerate(kept, start=1):
-            rows.append(mutation_row(source, mutation, index, args.model, args.severity))
+            rows.append(
+                mutation_row(source, mutation, index, args.model, args.severity, args.cohort)
+            )
             stats.mutation_rows += 1
             stats.by_type[mutation.mutation_type] = stats.by_type.get(mutation.mutation_type, 0) + 1
 
@@ -889,7 +907,9 @@ def main(argv: list[str] | None = None) -> int:
             recovered = [m for m in (validate(m, source, stats) for m in retry) if m]
             if recovered:
                 mutation = recovered[0]
-                rows.append(mutation_row(source, mutation, 99, args.model, args.severity))
+                rows.append(
+                    mutation_row(source, mutation, 99, args.model, args.severity, args.cohort)
+                )
                 stats.mutation_rows += 1
                 stats.by_type[required] = stats.by_type.get(required, 0) + 1
                 break

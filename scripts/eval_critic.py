@@ -55,6 +55,7 @@ class Outcome:
     expected: str
     mutation_type: str | None
     severity: str | None = None
+    cohort: str | None = None
     broken_criterion: str | None = None
     accepted: bool | None = None
     correct: bool = False
@@ -129,6 +130,7 @@ def grade_outcome(row: dict[str, Any], verdict: CriticVerdict) -> Outcome:
         expected=row["expected_verdict"],
         mutation_type=row.get("mutation_type"),
         severity=row.get("severity"),
+        cohort=row.get("cohort"),
         broken_criterion=row.get("broken_criterion"),
     )
     outcome.accepted = verdict.accepted
@@ -234,6 +236,37 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
             severity_table.add_row("(unlabelled)", f"—/{unlabelled}", "—", "—")
         console.print(severity_table)
 
+    # Tuned and holdout are never added together, and the table refuses to
+    # print a combined figure. A fixture that existed while the prompt was
+    # being written measures whether a known defect stayed closed; one that did
+    # not measures whether the judge generalises. Averaging them produces a
+    # number that answers neither question, and the average always flatters the
+    # tuned set because that is what the prompt was written against.
+    cohorts = [c for c in ("tuned", "holdout") if any(o.cohort == c for o in revises)]
+    if len(cohorts) > 1 or (cohorts and any(o.cohort is None for o in revises)):
+        cohort_table = Table(
+            title="Rejection rate by cohort — never sum these", header_style="bold"
+        )
+        cohort_table.add_column("Cohort")
+        cohort_table.add_column("What it measures")
+        cohort_table.add_column("Blatant", justify="right")
+        cohort_table.add_column("Borderline", justify="right")
+        meaning = {
+            "tuned": "was in the room when the prompt was written",
+            "holdout": "was not — this is the generalisation number",
+        }
+        for cohort in cohorts + ([None] if any(o.cohort is None for o in revises) else []):
+            items = [o for o in revises if o.cohort == cohort]
+            blatant = [o for o in items if o.severity == "blatant"]
+            borderline = [o for o in items if o.severity == "borderline"]
+            cohort_table.add_row(
+                cohort or "(unlabelled)",
+                meaning.get(cohort or "", "cohort not recorded"),
+                f"{sum(o.correct for o in blatant)}/{len(blatant)}" if blatant else "—",
+                f"{sum(o.correct for o in borderline)}/{len(borderline)}" if borderline else "—",
+            )
+        console.print(cohort_table)
+
     # Per criterion, because an aggregate hides which *kind* of rule the judge
     # is soft on. A Critic can be perfect on word counts and blind to implied
     # health claims, and the headline number reads the same either way.
@@ -303,6 +336,21 @@ def print_report(report: Report, budget: BudgetGuard, elapsed: float) -> dict[st
             }
             for level in ("blatant", "borderline")
             if any(o.severity == level for o in revises)
+        },
+        "by_cohort": {
+            cohort: {
+                level: {
+                    "cases": len(
+                        [o for o in revises if o.cohort == cohort and o.severity == level]
+                    ),
+                    "caught": sum(
+                        o.correct for o in revises if o.cohort == cohort and o.severity == level
+                    ),
+                }
+                for level in ("blatant", "borderline")
+                if any(o.cohort == cohort and o.severity == level for o in revises)
+            }
+            for cohort in {o.cohort for o in revises if o.cohort}
         },
         "by_criterion": {
             criterion: {
