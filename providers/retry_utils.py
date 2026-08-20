@@ -35,6 +35,53 @@ RETRYABLE_STATUS = {408, 409, 429}
 MAX_RETRY_WAIT = 75.0
 
 
+# A rate limit and an exhausted daily allowance arrive as the same HTTP 429,
+# and treating them alike is a real defect rather than a tuning choice: a
+# per-minute window reopens while you wait, a daily one does not. Backing off
+# against a daily cap buys nothing and costs everything -- one run sat blocked
+# for half an hour on a quota that would not reset until the next day.
+_DAILY_QUOTA_MARKERS = (
+    "perday",
+    "per day",
+    "per-day",
+    "daily",
+    "requests_per_day",
+    "quota_exceeded_per_day",
+)
+
+# No per-minute window is longer than this. A provider asking for more is
+# telling you the window is not per-minute, whatever it calls the quota.
+MINUTE_WINDOW_CEILING = 120.0
+
+
+class QuotaExhausted(RuntimeError):
+    """The allowance is gone until the provider resets it -- waiting will not help.
+
+    Deliberately not a ProviderError subclass, so it cannot be swallowed by the
+    per-item error handling that keeps a batch alive through transient
+    failures. Every remaining item in that batch would fail identically; the
+    honest move is to stop and say when it reopens.
+    """
+
+    def __init__(self, provider: str, message: str, retry_after: float | None = None):
+        super().__init__(f"[{provider}] daily quota exhausted: {message}")
+        self.provider = provider
+        self.retry_after = retry_after
+
+
+def looks_like_daily_quota(body: str, retry_after: float | None) -> bool:
+    """Whether a 429 is a spent allowance rather than a momentary rate limit.
+
+    Two independent signals, because vendors word this differently. Google
+    names the quota in the body (``...PerDay...``); others only betray it by
+    asking you to wait longer than any per-minute window could justify.
+    """
+    haystack = body.lower().replace(" ", "")
+    if any(marker.replace(" ", "") in haystack for marker in _DAILY_QUOTA_MARKERS):
+        return True
+    return retry_after is not None and retry_after > MINUTE_WINDOW_CEILING
+
+
 class ProviderError(RuntimeError):
     """A provider failure carrying the status code the retry policy needs.
 
@@ -62,6 +109,8 @@ class ProviderError(RuntimeError):
 
 
 def is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, QuotaExhausted):
+        return False
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code in RETRYABLE_STATUS or code >= 500
@@ -135,9 +184,12 @@ def raise_for_status(provider: str, response: httpx.Response) -> None:
     if response.is_success:
         return
     body = response.text[:800]
+    retry_after = parse_retry_after(response)
+    if response.status_code == 429 and looks_like_daily_quota(response.text, retry_after):
+        raise QuotaExhausted(provider, body, retry_after=retry_after)
     raise ProviderError(
         provider,
         f"HTTP {response.status_code}: {body}",
         status=response.status_code,
-        retry_after=parse_retry_after(response),
+        retry_after=retry_after,
     )

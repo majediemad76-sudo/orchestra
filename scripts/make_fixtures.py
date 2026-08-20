@@ -46,7 +46,7 @@ from rich.table import Table
 
 from budget import BudgetGuard
 from providers import anthropic
-from providers.retry_utils import ProviderError
+from providers.retry_utils import ProviderError, QuotaExhausted
 
 DEFAULT_RUNS = ROOT / "runs"
 DEFAULT_OUT = ROOT / "evals" / "critic_fixtures_draft.jsonl"
@@ -850,6 +850,12 @@ def main(argv: list[str] | None = None) -> int:
                 source, wanted, args.model, max_tokens=8000, severity=args.severity,
                 criterion_index=args.criterion,
             )
+        except QuotaExhausted as exc:
+            # Not a transient failure: every remaining run would fail the same
+            # way. Stop and keep what has already been written.
+            console.print(f"[red]{exc}[/red]")
+            console.print("[red]A daily allowance, not a rate limit. Re-run after it resets.[/red]")
+            break
         except (ProviderError, ValueError) as exc:
             # One unusable run must not cost the ones already generated.
             stats.rejected.append(f"{source.run_id}: {exc}")

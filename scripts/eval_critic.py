@@ -39,7 +39,7 @@ from rich.console import Console
 from rich.table import Table
 
 from budget import BudgetGuard
-from providers.retry_utils import ProviderError
+from providers.retry_utils import ProviderError, QuotaExhausted
 from roles import critic as critic_role
 from schemas import Criterion, CriticVerdict, ManagerPlan, WorkerOutput
 
@@ -378,9 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-unreviewed", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="judge only the first N fixtures")
     parser.add_argument(
-        "--delay", type=float, default=4.0,
-        help="seconds between calls. The default paces below the Gemini free tier's "
-             "15 requests per minute; pass 0 on a paid tier.",
+        "--delay", type=float, default=6.0,
+        help="seconds between calls. The default paces at 10 requests per minute, which "
+             "leaves real headroom under the Gemini free tier's 15 -- 4s sat exactly on "
+             "the limit and tipped into constant throttling as the fixture set grew. "
+             "Pass 0 on a paid tier.",
     )
     parser.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
@@ -424,7 +426,19 @@ def main(argv: list[str] | None = None) -> int:
             # Pacing beats retrying: a 429 costs the request and then a wait
             # long enough to clear the window anyway.
             time.sleep(args.delay)
-        outcome = judge(row, budget)
+        try:
+            outcome = judge(row, budget)
+        except QuotaExhausted as exc:
+            # Every remaining fixture would fail the same way, and no amount of
+            # waiting reopens a daily allowance. Stop, say so, and keep the
+            # partial results that were already paid for.
+            console.print(f"\n[red]{exc}[/red]")
+            console.print(
+                "[red]This is a daily allowance, not a rate limit -- backing off will not "
+                "help. Re-run after the provider's daily reset.[/red]"
+            )
+            report.errors.append(str(exc))
+            break
         report.outcomes.append(outcome)
         if outcome.error:
             report.errors.append(f"{outcome.fixture_id}: {outcome.error}")

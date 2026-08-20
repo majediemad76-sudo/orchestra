@@ -1039,6 +1039,48 @@ def check_retry_policy() -> None:
     check(wait_policy(_State(ProviderError("google", "x", 500), attempt=3)) > 0,
           "with no stated delay it falls back to exponential backoff")
 
+    # A daily allowance and a per-minute limit arrive as the same 429. Treating
+    # them alike left one run blocked for half an hour on a quota that would
+    # not reopen until the next day.
+    from providers.retry_utils import QuotaExhausted, looks_like_daily_quota, raise_for_status
+
+    minute_body = (
+        '{"error":{"code":429,"message":"Quota exceeded for metric: '
+        "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15. "
+        'Please retry in 30.6s."}}'
+    )
+    daily_body = (
+        '{"error":{"code":429,"message":"Quota exceeded","details":[{"violations":'
+        '[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}'
+    )
+    check(
+        not looks_like_daily_quota(minute_body, 30.6),
+        "a per-minute 429 is not mistaken for a daily one",
+    )
+    check(
+        looks_like_daily_quota(daily_body, None),
+        "a daily quota is recognised from the quota name in the body",
+    )
+    check(
+        looks_like_daily_quota('{"error":"429"}', 3600.0),
+        "a delay longer than any minute window is recognised as a daily quota",
+    )
+    try:
+        raise_for_status("google", httpx.Response(429, text=daily_body))
+        check(False, "a daily quota raises QuotaExhausted")
+    except QuotaExhausted as exc:
+        check(True, "a daily quota raises QuotaExhausted")
+        check(not is_retryable(exc), "QuotaExhausted is never retried -- waiting cannot help")
+    except Exception:
+        check(False, "a daily quota raises QuotaExhausted")
+    try:
+        raise_for_status("google", httpx.Response(429, text=minute_body))
+        check(False, "a per-minute 429 still raises the retryable ProviderError")
+    except QuotaExhausted:
+        check(False, "a per-minute 429 still raises the retryable ProviderError")
+    except ProviderError as exc:
+        check(is_retryable(exc), "a per-minute 429 still raises the retryable ProviderError")
+
     check(is_retryable(ProviderError("google", "x", 429)), "429 is retryable")
     check(is_retryable(ProviderError("google", "x", 503)), "5xx is retryable")
     check(not is_retryable(ProviderError("google", "x", 400)), "400 is not retryable")

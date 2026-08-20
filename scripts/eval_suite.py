@@ -38,6 +38,7 @@ from rich.console import Console
 from rich.table import Table
 
 from controller import run_task
+from providers.retry_utils import QuotaExhausted
 from schemas import Question, Task
 
 DEFAULT_TASKS = ROOT / "evals" / "tasks.jsonl"
@@ -326,6 +327,10 @@ def main(argv: list[str] | None = None) -> int:
         console.rule(f"[bold]{spec['id']}[/bold]")
         try:
             outcome = run_one(spec, suite_id)
+        except QuotaExhausted as exc:
+            console.print(f"[red]{exc}[/red]")
+            console.print("[red]A daily allowance, not a rate limit. Re-run after it resets.[/red]")
+            break
         except KeyboardInterrupt:
             # Interrupting a paid run should still report what it bought.
             console.print("[yellow]interrupted; reporting what finished[/yellow]")
