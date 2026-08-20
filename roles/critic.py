@@ -16,6 +16,8 @@ whatever is cheapest that week.
 
 from __future__ import annotations
 
+from typing import Any
+
 from providers import ProviderResult, google
 from providers.schema_utils import json_hint
 from schemas import Criterion, CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
@@ -55,14 +57,57 @@ def review(plan: ManagerPlan, output: WorkerOutput) -> tuple[CriticVerdict, Prov
         user=build_user_message(plan, output),
         model=MODEL,
     )
-    # Gemini expresses "this field is optional" as nullable, and then actually
-    # sends null -- an empty fix_instruction arrives as None rather than "".
-    # Dropping nulls hands the field back to its Pydantic default, which is
-    # what nullable was standing in for. The schema stays as-is: the vendor is
-    # within its rights here, and narrowing the schema would be the wrong fix.
-    data = {key: value for key, value in result.data.items() if value is not None}
+    data = _repair(drop_nulls(result.data))
     verdict = CriticVerdict.model_validate(data)
     return _reassert_criticality(verdict, plan), result
+
+
+def _repair(data: Any) -> Any:
+    """Make a stripped payload validatable again, without inventing judgements.
+
+    Dropping nulls is only half the job. ``critical`` and ``fix_instruction``
+    have defaults, so losing them is harmless -- but ``reason`` and
+    ``evidence`` do not, and stripping a null there turns one vendor quirk into
+    a different validation error. The whole verdict, already paid for, is lost
+    either way.
+
+    So: descriptive fields are backfilled with an empty string, because their
+    absence changes nothing about the verdict. The two fields that carry the
+    actual judgement, ``criterion`` and ``passed``, are never invented -- a
+    check missing either of them cannot be graded, so it is dropped, and the
+    empty-checks rule in CriticVerdict.accepted then fails closed on its own.
+    """
+    if not isinstance(data, dict):
+        return data
+    checks = data.get("checks")
+    if not isinstance(checks, list):
+        return data
+    repaired = []
+    for check in checks:
+        if not isinstance(check, dict) or "criterion" not in check or "passed" not in check:
+            continue
+        repaired.append({"evidence": "", "reason": "", **check})
+    return {**data, "checks": repaired}
+
+
+def drop_nulls(value: Any) -> Any:
+    """Strip nulls at every depth, so a Pydantic default takes over instead.
+
+    Gemini expresses "this field is optional" as nullable, and then actually
+    sends null -- an empty fix_instruction arrives as None rather than "".
+    Handing the field back to its default is what nullable was standing in for.
+
+    Stripping only the top level was not enough, and the gap cost a fixture in
+    a live run: one element of ``checks`` arrived with ``critical: null``, which
+    is nested two levels down, and the whole verdict failed validation. The
+    vendor is within its rights; narrowing the schema would be the wrong fix,
+    and so is patching one field at a time as each one bites.
+    """
+    if isinstance(value, dict):
+        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [drop_nulls(item) for item in value if item is not None]
+    return value
 
 
 def _reassert_criticality(verdict: CriticVerdict, plan: ManagerPlan) -> CriticVerdict:

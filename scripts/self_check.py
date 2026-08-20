@@ -833,6 +833,104 @@ def check_critic_harness() -> None:
     )
 
 
+def check_critic_null_handling() -> None:
+    """A null anywhere in the Critic's reply must not take down the run.
+
+    Gemini sends null for fields its own schema marked nullable. Stripping only
+    the top level looked sufficient until a live run died on
+    ``checks[6].critical = None`` -- two levels down, one fixture lost, the
+    whole verdict rejected. Every one of these has cost a real call, so each
+    depth is pinned here.
+    """
+    print("\n[13] Critic null handling")
+    from unittest.mock import patch
+
+    from providers import ProviderResult
+    from roles import critic as critic_role
+
+    check(critic_role.drop_nulls({"a": None, "b": 1}) == {"b": 1}, "top-level nulls are dropped")
+    check(
+        critic_role.drop_nulls({"a": {"b": None, "c": 2}}) == {"a": {"c": 2}},
+        "nulls one level down are dropped",
+    )
+    check(
+        critic_role.drop_nulls({"checks": [{"critical": None, "passed": True}]})
+        == {"checks": [{"passed": True}]},
+        "nulls inside a list of objects are dropped -- the case that killed a live run",
+    )
+    check(
+        critic_role.drop_nulls({"checks": [None, {"passed": True}]})
+        == {"checks": [{"passed": True}]},
+        "a null list element is dropped rather than validated",
+    )
+    check(
+        critic_role.drop_nulls({"a": 0, "b": "", "c": False, "d": []})
+        == {"a": 0, "b": "", "c": False, "d": []},
+        "falsy values that are not null survive",
+    )
+
+    plan = ManagerPlan(
+        plan="p",
+        worker_prompt="w",
+        acceptance_criteria=[
+            Criterion(text="c1", critical=True, check_method="m"),
+            Criterion(text="c2", critical=False, check_method="m"),
+        ],
+        worker_type="text",
+    )
+    payload = {
+        "checks": [
+            {
+                "criterion": "c1",
+                "passed": True,
+                "critical": None,        # the field that killed the live run
+                "evidence": "quoted",
+                "reason": "because",
+            },
+            {
+                "criterion": "c2",
+                "passed": False,
+                "critical": True,
+                "evidence": "quoted",
+                "reason": None,          # a null two levels down, different field
+            },
+        ],
+        "fix_instruction": None,          # the null that bit first, at the top level
+        "verdict": "accept",
+    }
+    with patch.object(
+        critic_role.google,
+        "call_structured",
+        return_value=ProviderResult(
+            data=payload, model="gemini-3.1-flash-lite", input_tokens=10, output_tokens=10
+        ),
+    ):
+        verdict, _ = critic_role.review(plan, WorkerOutput(result="anything"))
+    check(len(verdict.checks) == 2, "a verdict carrying nested nulls still parses")
+    check(verdict.fix_instruction == "", "a null fix_instruction falls back to its default")
+    check(verdict.checks[1].reason == "", "a null reason falls back to its default")
+    check(
+        verdict.checks[0].critical is True and verdict.checks[1].critical is False,
+        "criticality is still restored from the plan, not from the stripped null",
+    )
+    check(verdict.accepted is True, "the surviving verdict is still gradeable")
+
+    # A check with no criterion or no verdict cannot be graded; it is dropped
+    # rather than guessed at, and the empty-list rule then fails closed.
+    salvaged = critic_role._repair({"checks": [{"criterion": "c1"}, {"passed": True}]})
+    check(salvaged["checks"] == [], "a check missing criterion or passed is dropped, not invented")
+    kept = critic_role._repair({"checks": [{"criterion": "c1", "passed": True}]})
+    check(
+        kept["checks"][0]["reason"] == "" and kept["checks"][0]["evidence"] == "",
+        "descriptive fields are backfilled so a paid verdict is not lost",
+    )
+    check(
+        critic_role._repair({"checks": [{"criterion": "c", "passed": True, "reason": "kept"}]})
+        ["checks"][0]["reason"] == "kept",
+        "a reason that was actually sent is never overwritten",
+    )
+
+
 def check_fixture_file_integrity() -> None:
     """The committed fixture file must never contain an inverted expectation.
 
@@ -996,6 +1094,7 @@ def main() -> int:
     check_controller_state_machine()
     check_fixture_builder()
     check_critic_harness()
+    check_critic_null_handling()
     check_fixture_file_integrity()
     check_retry_policy()
     check_no_hardcoded_keys()
