@@ -1622,7 +1622,42 @@ def check_code_worker_isolation() -> None:
     check(called.called, "with the gate open, the code worker is actually invoked")
     check(allowed.output.ok is True, "an allowed code run comes back ok")
 
-    # 6. The refusal is a normal rejected round, not a new exception type.
+    # 6. Headless has nobody to approve a write, so the command must carry its
+    #    own permissions. Without this the CLI runs, burns its turns, exits 0,
+    #    and explains in prose that it could not create the file -- a failure
+    #    that costs real money and looks like the model being unhelpful.
+    captured: dict[str, Any] = {}
+
+    class _Done:
+        returncode = 0
+        stdout = '{"result": "done", "num_turns": 1, "total_cost_usd": 0.01}'
+        stderr = ""
+
+    def _capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return _Done()
+
+    with (
+        patch.object(claude_code.shutil, "which", return_value="/usr/local/bin/claude"),
+        patch.object(claude_code.subprocess, "run", _capture),
+    ):
+        claude_code.run("do a thing", cwd="/tmp")
+    cmd = captured["cmd"]
+    check("--allowedTools" in cmd, "the headless command carries --allowedTools")
+    granted = cmd[cmd.index("--allowedTools") + 1].split(",")
+    check("Write" in granted, "Write is granted, or the worker cannot create a file")
+    check("Bash" in granted, "Bash is granted, or the worker cannot run what it wrote")
+    check(
+        set(granted) == set(claude_code.DEFAULT_ALLOWED_TOOLS),
+        f"the grant is exactly the documented set -> {granted}",
+    )
+    check(
+        captured["env"] is not None and "ANTHROPIC_API_KEY" not in captured["env"],
+        "the real subprocess call is the one getting the filtered environment",
+    )
+
+    # 7. The refusal is a normal rejected round, not a new exception type.
     from roles import critic as critic_role
 
     verdict = critic_role.failed_worker_verdict(run.failure_reason, [CRITICAL_CRITERION])

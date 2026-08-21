@@ -28,6 +28,19 @@ DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_TURNS = 15
 CLI = "claude"
 
+# Headless has nobody to ask. Without --allowedTools the CLI treats a write as
+# needing approval, finds no interactive session to request it from, and denies
+# it -- so the session runs, spends its turns, and reports in prose that it
+# could not create the file. That failure is expensive and reads like a model
+# problem: the transcript is full of plausible attempts and the exit code is 0.
+#
+# The set below is what a code worker actually needs and no more. Bash is in it
+# because "write a script and run it" is the job; that is also why this backend
+# is off unless the caller opted in (see roles.worker.execute). Anything outside
+# this list still needs approval, and still gets denied, which is the intended
+# behaviour rather than an oversight.
+DEFAULT_ALLOWED_TOOLS = ("Read", "Write", "Edit", "Glob", "Grep", "Bash")
+
 # Everything the child is allowed to inherit, by name. An allowlist rather than
 # a denylist because the failure modes are not symmetric: forgetting to allow a
 # variable makes the CLI misbehave visibly and gets fixed, while forgetting to
@@ -56,6 +69,10 @@ INHERITED_ENV = (
     "SSL_CERT_FILE",   # custom CA bundles, where a proxy demands one
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "XDG_CONFIG_HOME",     # where the CLI looks for config when it is not ~/
+    "HTTPS_PROXY",         # a machine behind a proxy reaches nothing without
+    "HTTP_PROXY",          # these, and the failure looks like a network outage
+    "NO_PROXY",
     "__CF_USER_TEXT_ENCODING",  # macOS; its absence makes Python/node warn
 )
 
@@ -116,6 +133,10 @@ def run(
 
     Never raises. Every failure path returns a ``CodeResult`` the loop can
     treat as a rejection.
+
+    ``allowed_tools`` defaults to ``DEFAULT_ALLOWED_TOOLS`` rather than to
+    nothing: passing no list means the CLI can read but cannot write, which is
+    not a code worker.
     """
     if not available():
         return CodeResult(
@@ -125,8 +146,9 @@ def run(
         )
 
     cmd = [CLI, "-p", prompt, "--output-format", "json", "--max-turns", str(max_turns)]
-    if allowed_tools:
-        cmd += ["--allowedTools", ",".join(allowed_tools)]
+    tools = list(DEFAULT_ALLOWED_TOOLS) if allowed_tools is None else list(allowed_tools)
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
 
     try:
         completed = subprocess.run(

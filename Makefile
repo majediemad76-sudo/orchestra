@@ -11,6 +11,10 @@ SOURCES := $(shell find . -name '*.py' -not -path './.venv/*')
 # Small enough to be honest about, large enough to finish a short task.
 RUN_BUDGET ?= 0.10
 RUN_ROUNDS ?= 2
+# Working directory for the code worker. Empty means "wherever make was run",
+# which for this target is the repository itself -- so point it somewhere
+# disposable before asking for a task that writes files.
+RUN_CWD    ?=
 # Ceiling for the whole eval suite, not per task.
 EVAL_BUDGET ?= 1.00
 # Fixture drafting: how many accepted runs to mine, and the ceiling for the job.
@@ -56,7 +60,8 @@ lint: ## Byte-compile every source file
 
 run: ## Live smoke run against the real APIs -- costs money, needs .env
 	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }
-	$(PY) controller.py "$(GOAL)" --budget $(RUN_BUDGET) --max-rounds $(RUN_ROUNDS)
+	$(PY) controller.py "$(GOAL)" --budget $(RUN_BUDGET) --max-rounds $(RUN_ROUNDS) \
+		$(if $(RUN_CWD),--cwd $(RUN_CWD),)
 
 ui: ## Launch the Streamlit observer UI
 	./.venv/bin/streamlit run app.py
