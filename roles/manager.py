@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+from keys import ApiKeys
 from providers import ProviderResult, xai
 from providers.schema_utils import json_hint
 from schemas import CriticVerdict, ManagerPlan, Task
@@ -71,6 +72,8 @@ def plan(
     verdict: CriticVerdict | None = None,
     worker_result: str = "",
     user_answer: str = "",
+    *,
+    keys: ApiKeys,
 ) -> tuple[ManagerPlan, ProviderResult]:
     """Produce a plan for this round.
 
@@ -82,6 +85,7 @@ def plan(
         ManagerPlan,
         system=_system(),
         user=build_user_message(task, previous_plan, verdict, worker_result, user_answer),
+        api_key=keys.require("xai"),
         model=MODEL,
     )
     parsed = ManagerPlan.model_validate(result.data)

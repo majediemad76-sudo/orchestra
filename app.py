@@ -34,7 +34,6 @@ elsewhere.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import threading
 import time
@@ -47,6 +46,8 @@ from dotenv import load_dotenv
 
 from budget import SUBSCRIPTION_EQUIVALENT
 from controller import run_task
+from keys import ApiKeys
+from providers.redact import redact_exc
 from schemas import Question, Task
 
 ROOT = Path(__file__).resolve().parent
@@ -71,10 +72,12 @@ ESCALATION = "_escalation"
 # leave a thread parked forever.
 ESCALATION_TIMEOUT_SECONDS = 300
 
+# Keyed by provider, which is what ApiKeys speaks; the environment variable
+# name comes from keys.ENV_VARS so the two cannot drift apart.
 API_KEYS = {
-    "XAI_API_KEY": ("Manager", "grok-4.6"),
-    "ANTHROPIC_API_KEY": ("Worker", "claude-sonnet-5"),
-    "GOOGLE_API_KEY": ("Critic", "gemini-3.1-flash-lite"),
+    "xai": ("Manager", "grok-4.6"),
+    "anthropic": ("Worker", "claude-sonnet-5"),
+    "google": ("Critic", "gemini-3.1-flash-lite"),
 }
 
 STATUS_LABELS = {
@@ -108,12 +111,18 @@ def _run_in_background(
     outbox: queue.Queue[tuple[str, dict[str, Any]]],
     answers: queue.Queue[str],
     stop_flag: threading.Event,
+    keys: ApiKeys,
 ) -> None:
     """Body of the worker thread. Speaks only through the two queues.
 
     Nothing here may touch Streamlit -- not session_state, not st.*, not even
     a spinner. Every exit path posts exactly one terminal message so the UI
     can never be left waiting on a thread that has already died.
+
+    ``keys`` arrives as an argument rather than being read here, for the same
+    reason as everywhere else: this thread is a caller like any other. The
+    values are read once from the environment when the run is launched and are
+    never put in ``st.session_state``, which is rendered and logged.
     """
 
     def on_progress(event: str, data: dict[str, Any]) -> None:
@@ -145,12 +154,17 @@ def _run_in_background(
             on_progress=on_progress,
             on_escalation=on_escalation,
             stop_flag=stop_flag,
+            keys=keys,
         )
         outbox.put((FINISHED, summary))
     except EscalationTimeout as exc:
-        outbox.put((FAILED, {"error": str(exc), "timeout": True}))
+        outbox.put((FAILED, {"error": redact_exc(exc, *keys.secrets()), "timeout": True}))
     except Exception as exc:
-        outbox.put((FAILED, {"error": f"{type(exc).__name__}: {exc}"}))
+        # Everything a provider raises passes through here on its way to the
+        # screen. A vendor that echoes the offending request back puts the
+        # credential inside the exception text, so this is a leak path even
+        # though nothing here handles keys directly.
+        outbox.put((FAILED, {"error": redact_exc(exc, *keys.secrets())}))
 
 
 # --- state -----------------------------------------------------------------
@@ -250,9 +264,13 @@ def _start_run(goal: str, budget: float, max_rounds: int) -> None:
     answers: queue.Queue[str] = queue.Queue()
     stop_flag = threading.Event()
     task = Task(goal=goal, budget_usd=budget, max_rounds=max_rounds)
+    # Read once, here, and handed straight to the thread. Deliberately not
+    # stored in session_state: that dict is what the UI renders and what a
+    # Streamlit exception page dumps.
+    keys = ApiKeys.from_env()
     thread = threading.Thread(
         target=_run_in_background,
-        args=(task, outbox, answers, stop_flag),
+        args=(task, outbox, answers, stop_flag, keys),
         name="orchestrator-run",
         daemon=True,  # a closed tab must not keep the process alive
     )
@@ -496,8 +514,9 @@ def _render_sidebar() -> tuple[float, int]:
         # Presence only. The value is never read into a widget, a label, or a
         # log line -- not even a masked prefix, which is still key material.
         missing = []
-        for var, (role, model) in API_KEYS.items():
-            present = bool(os.environ.get(var, "").strip())
+        present_map = ApiKeys.from_env().present()
+        for provider, (role, model) in API_KEYS.items():
+            present = present_map.get(provider, False)
             if not present:
                 missing.append(role)
             st.markdown(

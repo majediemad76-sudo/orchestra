@@ -13,7 +13,6 @@ not here, so that the rules live next to the code that can violate them.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -27,18 +26,13 @@ API_URL = "https://api.x.ai/v1/chat/completions"
 DEFAULT_MODEL = "grok-4.6"
 
 
-def _api_key() -> str:
-    key = os.environ.get("XAI_API_KEY", "").strip()
-    if not key:
-        raise ProviderError("xai", "XAI_API_KEY is not set (see .env.example)")
-    return key
-
-
 @with_retry
 def call_structured(
     schema_model: type[BaseModel],
     system: str,
     user: str,
+    *,
+    api_key: str,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8000,
     timeout: float = 180.0,
@@ -53,12 +47,12 @@ def call_structured(
         "response_format": to_xai_schema(schema_model),
     }
     headers = {
-        "Authorization": f"Bearer {_api_key()}",
+        "Authorization": f"Bearer {api_key}",
         "content-type": "application/json",
     }
     with httpx.Client(timeout=timeout) as client:
         response = client.post(API_URL, headers=headers, json=payload)
-    raise_for_status("xai", response)
+    raise_for_status("xai", response, api_key)
     body = response.json()
 
     choices = body.get("choices") or []

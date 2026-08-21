@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -38,12 +37,16 @@ from rich.console import Console
 from rich.table import Table
 
 from controller import run_task
+from keys import ENV_VARS, ApiKeys
+from providers.redact import redact_exc
 from providers.retry_utils import QuotaExhausted
 from schemas import Question, Task
 
 DEFAULT_TASKS = ROOT / "evals" / "tasks.jsonl"
 DEFAULT_RESULTS = ROOT / "evals" / "results"
-REQUIRED_KEYS = ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")
+# All three roles run for real here, so all three credentials must be present
+# before the first cent is spent.
+REQUIRED_PROVIDERS = ("xai", "anthropic", "google")
 
 console = Console()
 
@@ -188,7 +191,7 @@ def grade(spec: dict[str, Any], summary: dict[str, Any]) -> list[str]:
     return failures
 
 
-def run_one(spec: dict[str, Any], suite_id: str) -> TaskResult:
+def run_one(spec: dict[str, Any], suite_id: str, keys: ApiKeys) -> TaskResult:
     outcome = TaskResult(id=spec["id"])
     task = Task(
         goal=spec["goal"],
@@ -202,10 +205,12 @@ def run_one(spec: dict[str, Any], suite_id: str) -> TaskResult:
             task,
             ask=_no_escalation,
             run_id=f"eval-{suite_id}-{spec['id']}",
+            keys=keys,
         )
     except Exception as exc:
         outcome.status = "crashed"
-        outcome.failures = [f"{type(exc).__name__}: {exc}"]
+        # Redacted because this string is printed and written to the report.
+        outcome.failures = [redact_exc(exc, *keys.secrets())]
         outcome.duration_s = round(time.time() - started, 2)
         return outcome
 
@@ -285,7 +290,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="skip the spend confirmation")
     args = parser.parse_args(argv)
 
-    missing = [key for key in REQUIRED_KEYS if not os.environ.get(key, "").strip()]
+    keys = ApiKeys.from_env()
+    present = keys.present()
+    missing = [ENV_VARS[name] for name in REQUIRED_PROVIDERS if not present[name]]
     if missing:
         console.print(f"[red]missing API keys: {', '.join(missing)}[/red]")
         console.print("this harness calls the real APIs; copy .env.example to .env first")
@@ -326,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         console.rule(f"[bold]{spec['id']}[/bold]")
         try:
-            outcome = run_one(spec, suite_id)
+            outcome = run_one(spec, suite_id, keys)
         except QuotaExhausted as exc:
             console.print(f"[red]{exc}[/red]")
             console.print("[red]A daily allowance, not a rate limit. Re-run after it resets.[/red]")

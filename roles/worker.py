@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from keys import ApiKeys
 from providers import anthropic, claude_code
 from schemas import ManagerPlan, WorkerOutput
 
@@ -45,14 +46,26 @@ class WorkerRun:
     failure_reason: str = ""
 
 
-def execute(plan: ManagerPlan, cwd: str | None = None) -> WorkerRun:
+def execute(plan: ManagerPlan, cwd: str | None = None, *, keys: ApiKeys) -> WorkerRun:
+    """Run the plan on whichever backend it asked for.
+
+    ``keys`` is required even for the code path, which does not use it: the
+    Manager picks the backend at runtime, so a caller cannot know in advance
+    which one will need a credential. Making it conditional would move that
+    failure from the call site to the middle of a paid round.
+    """
     if plan.worker_type == "code":
         return _execute_code(plan, cwd=cwd)
-    return _execute_text(plan)
+    return _execute_text(plan, keys=keys)
 
 
-def _execute_text(plan: ManagerPlan) -> WorkerRun:
-    result = anthropic.call_text(system=SYSTEM, user=plan.worker_prompt, model=TEXT_MODEL)
+def _execute_text(plan: ManagerPlan, *, keys: ApiKeys) -> WorkerRun:
+    result = anthropic.call_text(
+        system=SYSTEM,
+        user=plan.worker_prompt,
+        api_key=keys.require("anthropic"),
+        model=TEXT_MODEL,
+    )
     text = result.data.get("text", "").strip()
     return WorkerRun(
         output=WorkerOutput(result=text, ok=bool(text)),

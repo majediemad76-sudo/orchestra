@@ -26,6 +26,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from .redact import redact
+
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUS = {408, 409, 429}
 
@@ -174,16 +176,22 @@ def parse_retry_after(response: httpx.Response) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def raise_for_status(provider: str, response: httpx.Response) -> None:
+def raise_for_status(provider: str, response: httpx.Response, *secrets: str) -> None:
     """Convert a non-2xx response into a ``ProviderError``.
 
     The body is truncated but never dropped: vendor error messages are where
     the actual cause lives ("schema is invalid", "credit balance too low"), and
     a bare status code turns a two-minute fix into an afternoon.
+
+    It is also the one place a credential can re-enter the program from
+    outside: several vendors quote the offending request back, headers
+    included. The body is scrubbed here rather than at each call site,
+    because this is the only constructor of these errors and a call site
+    that forgets is a leak nobody notices until it is in a log.
     """
     if response.is_success:
         return
-    body = response.text[:800]
+    body = redact(response.text[:800], *secrets)
     retry_after = parse_retry_after(response)
     if response.status_code == 429 and looks_like_daily_quota(response.text, retry_after):
         raise QuotaExhausted(provider, body, retry_after=retry_after)

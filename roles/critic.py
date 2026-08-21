@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from keys import ApiKeys
 from providers import ProviderResult, google
 from providers.schema_utils import json_hint
 from schemas import Criterion, CriterionCheck, CriticVerdict, ManagerPlan, WorkerOutput
@@ -49,12 +50,15 @@ def build_user_message(plan: ManagerPlan, output: WorkerOutput) -> str:
     )
 
 
-def review(plan: ManagerPlan, output: WorkerOutput) -> tuple[CriticVerdict, ProviderResult]:
+def review(
+    plan: ManagerPlan, output: WorkerOutput, *, keys: ApiKeys
+) -> tuple[CriticVerdict, ProviderResult]:
     """Grade one Worker output against the plan's acceptance criteria."""
     result = google.call_structured(
         CriticVerdict,
         system=_system(),
         user=build_user_message(plan, output),
+        api_key=keys.require("google"),
         model=MODEL,
     )
     data = _repair(drop_nulls(result.data))

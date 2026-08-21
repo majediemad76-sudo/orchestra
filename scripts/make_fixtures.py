@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 from collections.abc import Iterable
@@ -45,6 +44,7 @@ from rich.console import Console
 from rich.table import Table
 
 from budget import BudgetGuard
+from keys import ApiKeys
 from providers import anthropic
 from providers.retry_utils import ProviderError, QuotaExhausted
 
@@ -297,6 +297,8 @@ def request_mutations(
     max_tokens: int,
     severity: str = "blatant",
     criterion_index: int = 0,
+    *,
+    keys: ApiKeys,
 ) -> tuple[list[Mutation], list[str], int, int]:
     """One structured call to Claude.
 
@@ -329,6 +331,7 @@ def request_mutations(
         MutationSet,
         system=SYSTEM.format(guide=MUTATION_GUIDE),
         user=user,
+        api_key=keys.require("anthropic"),
         model=model,
         max_tokens=max_tokens,
     )
@@ -819,7 +822,8 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[yellow]dry run: no API calls, nothing written[/yellow]")
         return 0
 
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+    keys = ApiKeys.from_env()
+    if not keys.present()["anthropic"]:
         console.print("[red]ANTHROPIC_API_KEY is not set; mutations are written by Claude[/red]")
         return 2
     if not args.yes:
@@ -848,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             mutations, problems, tin, tout = request_mutations(
                 source, wanted, args.model, max_tokens=8000, severity=args.severity,
-                criterion_index=args.criterion,
+                criterion_index=args.criterion, keys=keys,
             )
         except QuotaExhausted as exc:
             # Not a transient failure: every remaining run would fail the same
@@ -903,7 +907,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 retry, problems, tin, tout = request_mutations(
                     source, [required], args.model, max_tokens=4000, severity=args.severity,
-                    criterion_index=args.criterion,
+                    criterion_index=args.criterion, keys=keys,
                 )
             except (ProviderError, ValueError) as exc:
                 stats.rejected.append(f"{source.run_id}: {required} retry failed -- {exc}")

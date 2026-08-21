@@ -25,7 +25,6 @@ a Bedrock endpoint.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -41,18 +40,13 @@ DEFAULT_MODEL = "claude-sonnet-5"
 TOOL_NAME = "emit_result"
 
 
-def _api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
-        raise ProviderError("anthropic", "ANTHROPIC_API_KEY is not set (see .env.example)")
-    return key
-
-
 @with_retry
 def call_structured(
     schema_model: type[BaseModel],
     system: str,
     user: str,
+    *,
+    api_key: str,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8000,
     timeout: float = 180.0,
@@ -70,13 +64,13 @@ def call_structured(
         "tool_choice": {"type": "tool", "name": TOOL_NAME},
     }
     headers = {
-        "x-api-key": _api_key(),
+        "x-api-key": api_key,
         "anthropic-version": API_VERSION,
         "content-type": "application/json",
     }
     with httpx.Client(timeout=timeout) as client:
         response = client.post(API_URL, headers=headers, json=payload)
-    raise_for_status("anthropic", response)
+    raise_for_status("anthropic", response, api_key)
     body = response.json()
 
     data = _extract_tool_input(body)
@@ -125,6 +119,8 @@ def _loads_or_none(text: str) -> dict[str, Any] | None:
 def call_text(
     system: str,
     user: str,
+    *,
+    api_key: str,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8000,
     timeout: float = 180.0,
@@ -142,13 +138,13 @@ def call_text(
         "messages": [{"role": "user", "content": user}],
     }
     headers = {
-        "x-api-key": _api_key(),
+        "x-api-key": api_key,
         "anthropic-version": API_VERSION,
         "content-type": "application/json",
     }
     with httpx.Client(timeout=timeout) as client:
         response = client.post(API_URL, headers=headers, json=payload)
-    raise_for_status("anthropic", response)
+    raise_for_status("anthropic", response, api_key)
     body = response.json()
     text = "".join(
         block.get("text", "") for block in body.get("content", []) if block.get("type") == "text"

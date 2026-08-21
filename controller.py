@@ -53,6 +53,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from budget import API_BILLED, SUBSCRIPTION_EQUIVALENT, BudgetGuard
+from keys import ApiKeys
 from roles import critic as critic_role
 from roles import manager as manager_role
 from roles import worker as worker_role
@@ -260,6 +261,8 @@ def run_task(
     on_progress: ProgressFn | None = None,
     on_escalation: EscalationFn | None = None,
     stop_flag: threading.Event | None = None,
+    *,
+    keys: ApiKeys,
 ) -> dict[str, Any]:
     """Run the Manager/Worker/Critic loop to acceptance, exhaustion or halt.
 
@@ -283,6 +286,11 @@ def run_task(
 
     With all three omitted this is the original headless behaviour, down to the
     console prompts.
+
+    ``keys`` is required and keyword-only. It is not read from the environment
+    here: this function is called both by a single-user CLI and by an HTTP
+    server handling one caller's credentials per request, and only the caller
+    knows which. Nothing in this module or below it touches ``os.environ``.
     """
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     run_id = run_id or f"{stamp}-{uuid.uuid4().hex[:6]}"
@@ -349,6 +357,7 @@ def run_task(
             verdict=state.verdict,
             worker_result=state.output.result if state.output else "",
             user_answer=state.user_answer,
+            keys=keys,
         )
         entry = state.budget.charge(
             f"round{state.round}.manager",
@@ -411,7 +420,7 @@ def run_task(
             continue
 
         # --- Worker --------------------------------------------------------
-        run = worker_role.execute(plan, cwd=cwd)
+        run = worker_role.execute(plan, cwd=cwd, keys=keys)
         if run.cost_usd is not None:
             # Only Claude Code headless reports dollars directly, and on a
             # personal subscription that figure is API-equivalent rather than
@@ -467,7 +476,7 @@ def run_task(
                 synthetic=True,
             )
         else:
-            verdict, critic_call = critic_role.review(plan, run.output)
+            verdict, critic_call = critic_role.review(plan, run.output, keys=keys)
             entry = state.budget.charge(
                 f"round{state.round}.critic",
                 critic_call.model,
@@ -609,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=args.max_rounds,
         budget_usd=args.budget,
     )
-    summary = run_task(task, cwd=args.cwd)
+    summary = run_task(task, cwd=args.cwd, keys=ApiKeys.from_env())
     print_summary(summary)
     return 0 if summary["status"].startswith("accepted") else 1
 

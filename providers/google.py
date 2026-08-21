@@ -13,7 +13,6 @@ grading pass on every round affordable.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -27,18 +26,13 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 
-def _api_key() -> str:
-    key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not key:
-        raise ProviderError("google", "GOOGLE_API_KEY is not set (see .env.example)")
-    return key
-
-
 @with_retry
 def call_structured(
     schema_model: type[BaseModel],
     system: str,
     user: str,
+    *,
+    api_key: str,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8000,
     timeout: float = 180.0,
@@ -52,11 +46,11 @@ def call_structured(
             "maxOutputTokens": max_tokens,
         },
     }
-    headers = {"x-goog-api-key": _api_key(), "content-type": "application/json"}
+    headers = {"x-goog-api-key": api_key, "content-type": "application/json"}
     url = f"{API_BASE}/{model}:generateContent"
     with httpx.Client(timeout=timeout) as client:
         response = client.post(url, headers=headers, json=payload)
-    raise_for_status("google", response)
+    raise_for_status("google", response, api_key)
     body = response.json()
 
     candidates = body.get("candidates") or []

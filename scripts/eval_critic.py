@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from collections import defaultdict
@@ -39,6 +38,8 @@ from rich.console import Console
 from rich.table import Table
 
 from budget import BudgetGuard
+from keys import ApiKeys
+from providers.redact import redact_exc
 from providers.retry_utils import ProviderError, QuotaExhausted
 from roles import critic as critic_role
 from schemas import Criterion, CriticVerdict, ManagerPlan, WorkerOutput
@@ -148,16 +149,19 @@ def grade_outcome(row: dict[str, Any], verdict: CriticVerdict) -> Outcome:
     return outcome
 
 
-def judge(row: dict[str, Any], budget: BudgetGuard) -> Outcome:
+def judge(row: dict[str, Any], budget: BudgetGuard, keys: ApiKeys) -> Outcome:
     """Ask the real Critic about one fixture, then grade what came back."""
     try:
-        verdict, call = critic_role.review(as_plan(row), WorkerOutput(result=row["output"]))
+        verdict, call = critic_role.review(
+            as_plan(row), WorkerOutput(result=row["output"]), keys=keys
+        )
     except (ProviderError, ValueError) as exc:
         return Outcome(
             fixture_id=row["fixture_id"],
             expected=row["expected_verdict"],
             mutation_type=row.get("mutation_type"),
-            error=f"{type(exc).__name__}: {exc}",
+            # Written into evals/results/*.json, so it is scrubbed first.
+            error=redact_exc(exc, *keys.secrets()),
         )
 
     entry = budget.charge(row["fixture_id"][:40], call.model, call.input_tokens, call.output_tokens)
@@ -391,7 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[red]no fixtures at {args.fixtures}[/red]")
         console.print("build them first: make fixture, then review the draft")
         return 2
-    if not os.environ.get("GOOGLE_API_KEY", "").strip():
+    keys = ApiKeys.from_env()
+    if not keys.present()["google"]:
         console.print("[red]GOOGLE_API_KEY is not set; the Critic runs on Gemini[/red]")
         return 2
 
@@ -427,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             # long enough to clear the window anyway.
             time.sleep(args.delay)
         try:
-            outcome = judge(row, budget)
+            outcome = judge(row, budget, keys)
         except QuotaExhausted as exc:
             # Every remaining fixture would fail the same way, and no amount of
             # waiting reopens a daily allowance. Stop, say so, and keep the

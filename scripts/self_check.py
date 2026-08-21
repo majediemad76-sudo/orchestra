@@ -17,6 +17,7 @@ a pre-commit gate on a machine with nothing installed but the venv.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import controller as controller_module
+from keys import ApiKeys
 from providers.schema_utils import (
     resolve_refs,
     to_anthropic_schema,
@@ -45,6 +47,26 @@ from schemas import (
 
 FAILURES: list[str] = []
 CHECKS = 0
+
+# Values that look like credentials to every code path that handles them, and
+# are worth nothing if they escape. Every offline check that reaches a function
+# now demanding an ApiKeys uses these -- a real key must never be needed to run
+# the gate, and a check that silently fell back to the environment would pass on
+# a developer machine and fail in CI.
+CANARY_KEY = "sk-CANARY-9f3a"
+FAKE_KEYS = ApiKeys(xai=CANARY_KEY, anthropic=CANARY_KEY, google=CANARY_KEY)
+
+# Invented credentials in the three shapes the vendors actually issue, used to
+# prove the redactor catches a key it was never handed. Listed here, in one
+# place, because the hard-coded-key scan has to know which strings in this file
+# are deliberate props -- and the alternative, exempting this whole file, would
+# switch the scan off exactly where test values live.
+UNHELD_KEY_SHAPES = (
+    "sk-ant-api03-AbCdEfGh12345678",
+    "xai-ZZZZaaaa1111bbbb",
+    "AIzaSyD-aaaa1111bbbb",
+)
+FAKE_CREDENTIALS = (CANARY_KEY, *UNHELD_KEY_SHAPES)
 
 CRITICAL_CRITERION = Criterion(
     text="under 150 words", critical=True, check_method="count the words"
@@ -397,7 +419,7 @@ def check_controller_state_machine() -> None:
         )
         return plan, ProviderResult(data={}, model="grok-4.6", input_tokens=100, output_tokens=100)
 
-    def fake_worker(plan, cwd=None):
+    def fake_worker(plan, cwd=None, **_):
         calls["worker"] += 1
         return controller.worker_role.WorkerRun(
             output=WorkerOutput(result="fake result"),
@@ -407,7 +429,7 @@ def check_controller_state_machine() -> None:
         )
 
     def make_critic(passes: bool):
-        def fake_review(plan, output):
+        def fake_review(plan, output, **_):
             calls["critic"] += 1
             return (
                 CriticVerdict(
@@ -436,7 +458,9 @@ def check_controller_state_machine() -> None:
         controller.manager_role.plan = fake_plan
         controller.worker_role.execute = fake_worker
         controller.critic_role.review = make_critic(True)
-        summary = controller.run_task(Task(goal="g"), ask=_fake_ask(0), run_id="selfcheck-accept")
+        summary = controller.run_task(
+            Task(goal="g"), ask=_fake_ask(0), run_id="selfcheck-accept", keys=FAKE_KEYS
+        )
         check(summary["status"] == "accepted", "accepts when every criterion passes")
         check(summary["rounds"] == 1, "stops as soon as it is accepted")
         check(summary["budget"]["spent_usd"] > 0, "cost is accumulated")
@@ -453,7 +477,10 @@ def check_controller_state_machine() -> None:
         calls.update({"manager": 0, "worker": 0, "critic": 0})
         controller.critic_role.review = make_critic(False)
         summary = controller.run_task(
-            Task(goal="g", max_rounds=6), ask=_fake_ask(2), run_id="selfcheck-reject"
+            Task(goal="g", max_rounds=6),
+            ask=_fake_ask(2),
+            run_id="selfcheck-reject",
+            keys=FAKE_KEYS,
         )
         check(summary["status"] == "accepted_by_user", "two rejections escalate to the user")
         check(summary["rounds"] == 2, "the escalation fires on the second rejection, not later")
@@ -467,7 +494,10 @@ def check_controller_state_machine() -> None:
         calls.update({"manager": 0, "worker": 0, "critic": 0})
         controller.critic_role.review = make_critic(True)
         summary = controller.run_task(
-            Task(goal="g", context="ask"), ask=_fake_ask(1), run_id="selfcheck-ask"
+            Task(goal="g", context="ask"),
+            ask=_fake_ask(1),
+            run_id="selfcheck-ask",
+            keys=FAKE_KEYS,
         )
         check(
             [e["trigger"] for e in summary["escalations"]] == ["manager_needs_input"],
@@ -484,6 +514,7 @@ def check_controller_state_machine() -> None:
             Task(goal="g", budget_usd=0.0005, max_rounds=6),
             ask=_fake_ask(2),
             run_id="selfcheck-budget",
+            keys=FAKE_KEYS,
         )
         check(
             summary["escalations"][0]["trigger"] == "budget_exceeded",
@@ -498,6 +529,7 @@ def check_controller_state_machine() -> None:
             Task(goal="g", budget_usd=0.0005, max_rounds=6),
             ask=lambda q: None,
             run_id="selfcheck-noanswer",
+            keys=FAKE_KEYS,
         )
         check(summary["status"] == "stopped_by_user", "an unanswered escalation stops the run")
     finally:
@@ -587,7 +619,9 @@ def check_fixture_builder() -> None:
     with patch.object(mf.anthropic, "call_structured",
                       return_value=ProviderResult(data=payload, model="claude-sonnet-5",
                                                   input_tokens=10, output_tokens=10)):
-        kept, problems, _, _ = mf.request_mutations(source, ["factual"], "claude-sonnet-5", 100)
+        kept, problems, _, _ = mf.request_mutations(
+            source, ["factual"], "claude-sonnet-5", 100, keys=FAKE_KEYS
+        )
     check(len(kept) == 2 and len(problems) == 1,
           "one malformed mutation is skipped, the rest of the batch survives")
 
@@ -905,7 +939,7 @@ def check_critic_null_handling() -> None:
             data=payload, model="gemini-3.1-flash-lite", input_tokens=10, output_tokens=10
         ),
     ):
-        verdict, _ = critic_role.review(plan, WorkerOutput(result="anything"))
+        verdict, _ = critic_role.review(plan, WorkerOutput(result="anything"), keys=FAKE_KEYS)
     check(len(verdict.checks) == 2, "a verdict carrying nested nulls still parses")
     check(verdict.fix_instruction == "", "a null fix_instruction falls back to its default")
     check(verdict.checks[1].reason == "", "a null reason falls back to its default")
@@ -1095,21 +1129,51 @@ def check_no_hardcoded_keys() -> None:
     literal = re.compile(
         r"""(sk-[A-Za-z0-9_-]{12,}|xai-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})"""
     )
+    # The deliberate fakes in this file are removed before the scan rather than
+    # being allowed to slip under the length threshold: relying on "it happens
+    # not to match" means the check silently stops covering this file the day
+    # one of them gets longer.
+    def without_props(text: str) -> str:
+        for prop in FAKE_CREDENTIALS:
+            text = text.replace(prop, "")
+        return text
+
     offenders = [
         str(p.relative_to(ROOT))
         for p in sources
-        if literal.search(p.read_text(encoding="utf-8"))
+        if literal.search(without_props(p.read_text(encoding="utf-8")))
     ]
     check(
         not offenders,
         f"no key literal in any source file{(' -> ' + ', '.join(offenders)) if offenders else ''}",
     )
 
-    for var in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
-        used = any(
-            var in p.read_text(encoding="utf-8") for p in sources if p.parts[-2] == "providers"
+    # The inverse of what this file used to assert. Ambient credentials are the
+    # bug now: a provider that can reach os.environ cannot serve two callers
+    # with different keys, and will quietly use the wrong one instead of
+    # failing. Reading the environment is the entry point's job.
+    provider_sources = [p for p in sources if p.parts[-2] == "providers"]
+    check(bool(provider_sources), "there are provider modules to inspect")
+    for path in provider_sources:
+        body = path.read_text(encoding="utf-8")
+        check(
+            "os.environ" not in body and "getenv" not in body,
+            f"providers/{path.name} does not read the environment",
         )
-        check(used, f"{var} is read from the environment in providers/")
+
+    # Exactly one place may, so there is exactly one place to audit. Matched as
+    # a call rather than as a substring, so that naming the pattern in prose --
+    # in this check, in a docstring, in a comment -- does not count as using it.
+    env_call = re.compile(r"\bos\.environ\s*(?:\.get\s*\(|\[)")
+    readers = sorted(
+        str(p.relative_to(ROOT))
+        for p in sources
+        if env_call.search(p.read_text(encoding="utf-8"))
+    )
+    check(
+        readers == ["keys.py"],
+        f"the environment is read in keys.py and nowhere else -> {readers}",
+    )
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     check(
         all(f"{v}=" in example for v in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")),
@@ -1123,6 +1187,131 @@ def check_no_hardcoded_keys() -> None:
         not (ROOT / ".env").exists() or ".env" in (ROOT / ".gitignore").read_text(),
         ".env is git-ignored",
     )
+
+
+def check_canary_never_escapes() -> None:
+    """Break every provider error path on purpose and hunt for the credential.
+
+    The rule "never log a key" is the kind that holds until the day a vendor
+    answers a 400 by quoting the request back, headers included. Asserting it
+    by reading the code does not survive a refactor; this drives the actual
+    paths with a value that must never appear and then searches everything they
+    produced -- return values, exception text, stdout, and the JSONL on disk.
+
+    Entirely offline: the responses are hand-built, the roles are fakes, and the
+    only key in play is worthless.
+    """
+    print("\n[14] Canary: no credential in any output")
+    import contextlib
+    import io as _io
+    import re
+
+    import httpx
+
+    import controller
+    from providers import ProviderResult
+    from providers.redact import redact, redact_exc
+    from providers.retry_utils import ProviderError, raise_for_status
+
+    def clean(label: str, *blobs: str) -> None:
+        hit = next((b for b in blobs if CANARY_KEY in b), None)
+        check(hit is None, f"{label} carries no canary")
+
+    # 1. The repr of the carrier itself. This is what lands in a traceback frame.
+    clean("repr(ApiKeys)", repr(FAKE_KEYS), str(FAKE_KEYS), f"{FAKE_KEYS}")
+    check(
+        "set" in repr(FAKE_KEYS) and "missing" in repr(ApiKeys(xai=CANARY_KEY)),
+        "repr still says which keys are present",
+    )
+
+    # 2. A vendor 400 that quotes our own request back, headers and all -- the
+    #    exact shape that makes this more than a hypothetical.
+    echoed = (
+        '{"error":{"code":400,"message":"invalid request",'
+        '"request":{"headers":{"Authorization":"Bearer ' + CANARY_KEY + '",'
+        '"x-api-key":"' + CANARY_KEY + '"}}}}'
+    )
+    for provider in ("xai", "anthropic", "google"):
+        response = httpx.Response(400, text=echoed, request=httpx.Request("POST", "https://x/y"))
+        try:
+            raise_for_status(provider, response, CANARY_KEY)
+        except ProviderError as exc:
+            clean(f"{provider} 400 error", str(exc), repr(exc), exc.message, redact_exc(exc))
+        else:
+            check(False, f"{provider} 400 raised nothing")
+
+    # 3. A key we were never handed -- the backstop patterns, not exact removal.
+    for shape in UNHELD_KEY_SHAPES:
+        body = '{"error":"bad key ' + shape + '"}'
+        response = httpx.Response(401, text=body, request=httpx.Request("POST", "https://x/y"))
+        try:
+            raise_for_status("xai", response)  # deliberately no secrets passed
+        except ProviderError as exc:
+            check(shape not in str(exc), f"an unheld {shape[:7]}... key is still redacted")
+
+    # 4. A whole run whose Worker dies inside the provider, driven end to end.
+    #    Fake roles, real Controller, real RunLog, real file on disk.
+    saved = (
+        controller.manager_role.plan,
+        controller.worker_role.execute,
+        controller.critic_role.review,
+    )
+    saved_runs = controller.RUNS_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="orchestrator-canary-"))
+    controller.RUNS_DIR = tmp
+    buffer = _io.StringIO()
+    try:
+        def fake_plan(task, previous_plan=None, verdict=None, worker_result="", **_):
+            return (
+                ManagerPlan(
+                    plan="p",
+                    worker_prompt="w",
+                    acceptance_criteria=[CRITICAL_CRITERION],
+                    worker_type="text",
+                ),
+                ProviderResult(data={}, model="grok-4.6", input_tokens=1, output_tokens=1),
+            )
+
+        def exploding_worker(plan, cwd=None, **_):
+            raise ProviderError(
+                "anthropic",
+                f"HTTP 401: {echoed}",  # unredacted on purpose: this is the hostile case
+                status=401,
+            )
+
+        controller.manager_role.plan = fake_plan
+        controller.worker_role.execute = exploding_worker
+        controller.critic_role.review = lambda *a, **k: None
+
+        raised = ""
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            try:
+                controller.run_task(
+                    Task(goal="g"), ask=lambda q: None, run_id="canary", keys=FAKE_KEYS
+                )
+            except BaseException as exc:
+                raised = redact_exc(exc, *FAKE_KEYS.secrets())
+
+        clean("the redacted exception the entry point would show", raised)
+        clean("everything the run printed", buffer.getvalue())
+
+        written = sorted(tmp.rglob("*.jsonl"))
+        check(bool(written), "the run really did write a log to inspect")
+        for path in written:
+            clean(f"runs/{path.name}", path.read_text(encoding="utf-8"))
+    finally:
+        (
+            controller.manager_role.plan,
+            controller.worker_role.execute,
+            controller.critic_role.review,
+        ) = saved
+        controller.RUNS_DIR = saved_runs
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 5. The scrubber keeps the message readable rather than blanking it.
+    scrubbed = redact(f"HTTP 401: bad key {CANARY_KEY} for account 42", CANARY_KEY)
+    check("HTTP 401" in scrubbed and "account 42" in scrubbed, "redaction keeps the diagnosis")
+    check(re.search(r"\[REDACTED\]", scrubbed) is not None, "redaction leaves a visible marker")
 
 
 def main() -> int:
@@ -1140,6 +1329,7 @@ def main() -> int:
     check_fixture_file_integrity()
     check_retry_policy()
     check_no_hardcoded_keys()
+    check_canary_never_escapes()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:
