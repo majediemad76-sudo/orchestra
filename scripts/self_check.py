@@ -1485,12 +1485,22 @@ def check_http_api() -> None:
             )
             silent_id = created.json()["task_id"]
             timed = wait_for(silent_id, {"finished", "failed"})
-        check(timed["status"] == "failed", "an unanswered escalation ends the run")
-        check(timed["timed_out"] is True, "the record says it timed out, not merely failed")
+        check(timed["status"] == "finished", "an unanswered escalation still finishes")
+        check(timed["timed_out"] is True, "the timeout is carried by the flag, not by the status")
+        check(timed["error"] is None, "finishing on a timeout is not an error")
+        # The point of the fix: the run reached its own ending, so what it had
+        # already done survives. Raising from inside the hook destroyed all of
+        # this to report that nobody clicked.
+        check(timed["summary"] is not None, "the summary survives the timeout")
         check(
-            "No answer within" in (timed["error"] or ""),
-            "the error names the cause rather than leaving a bare exception",
+            timed["summary"]["status"] == "escalated_unanswered",
+            "the Controller ended it through its own no-answer path",
         )
+        check(
+            timed["summary"]["budget"]["spent_usd"] > 0,
+            "the spend that already happened is still reported",
+        )
+        check(timed["summary"]["rounds"] >= 1, "the rounds already run are still reported")
         check(timed["question"] is None, "the stale question is cleared")
         silent = api._TASKS[silent_id]
         check(

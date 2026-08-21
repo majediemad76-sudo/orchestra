@@ -43,7 +43,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from controller import run_task
-from escalation import ESCALATION_TIMEOUT_SECONDS, EscalationTimeout
+from escalation import ESCALATION_TIMEOUT_SECONDS, NO_ANSWER
 from keys import ApiKeys
 from providers.redact import redact_exc
 from schemas import Question, Task
@@ -107,10 +107,10 @@ class TaskState(BaseModel):
     question: PendingQuestion | None = None
     summary: dict[str, Any] | None = None
     error: str | None = None
-    # Set when the run ended because nobody answered an escalation. A separate
-    # field because a poller cannot otherwise tell "no one was there" from "a
-    # provider broke", and the two call for different reactions: come back and
-    # answer, versus look at what failed.
+    # Set when an escalation went unanswered. Independent of ``status``: the
+    # run still finishes, and ``summary`` still holds the rounds and the spend.
+    # This is the only thing separating "nobody came back" from "the caller
+    # pressed stop", since both hand the Controller the same empty answer.
     timed_out: bool = False
 
 
@@ -200,14 +200,16 @@ def _run(record: TaskRecord, task: Task, cwd: str | None) -> None:
         try:
             answer = record.answers.get(timeout=ESCALATION_TIMEOUT_SECONDS)
         except queue.Empty:
-            # Raised rather than returned as an empty answer, matching app.py.
-            # An empty answer is what the *stop* endpoint posts, so returning
-            # one here would make "nobody came back" indistinguishable from
-            # "the caller ended it" in the record afterwards. Either way the
-            # run ends; neither becomes a default choice.
-            raise EscalationTimeout(
-                f"No answer within {ESCALATION_TIMEOUT_SECONDS:.0f}s: {question.text}"
-            ) from None
+            # Exactly what POST /task/{id}/stop posts, and for the same reason:
+            # the Controller reads it as "no option was chosen" and ends the run
+            # itself, returning a full summary. Raising here instead would kill
+            # run_task from the inside and throw that summary away -- the rounds
+            # and the spend that already happened -- to report a click that did
+            # not. The two cases stay apart through record.timed_out, not
+            # through the shape of the exit.
+            with _LOCK:
+                record.timed_out = True
+            answer = NO_ANSWER
         finally:
             with _LOCK:
                 record.question = None
@@ -233,11 +235,6 @@ def _run(record: TaskRecord, task: Task, cwd: str | None) -> None:
         with _LOCK:
             record.summary = summary
             record.status = "finished"
-    except EscalationTimeout as exc:
-        with _LOCK:
-            record.error = str(exc)
-            record.timed_out = True
-            record.status = "failed"
     except BaseException as exc:
         # Broad on purpose: whatever went wrong, the poller must get exactly one
         # terminal record or it waits forever on a thread that is already gone.

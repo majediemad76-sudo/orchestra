@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 
 from budget import SUBSCRIPTION_EQUIVALENT
 from controller import run_task
-from escalation import ESCALATION_TIMEOUT_SECONDS, EscalationTimeout
+from escalation import ESCALATION_TIMEOUT_SECONDS, NO_ANSWER
 from keys import ApiKeys
 from providers.redact import redact_exc
 from schemas import Question, Task
@@ -117,6 +117,10 @@ def _run_in_background(
     never put in ``st.session_state``, which is rendered and logged.
     """
 
+    # Set by the escalation hook, read once at the end. A flag rather than an
+    # exception, so that timing out costs the caller a fact and not the result.
+    timed_out = threading.Event()
+
     def on_progress(event: str, data: dict[str, Any]) -> None:
         outbox.put((event, data))
 
@@ -132,13 +136,14 @@ def _run_in_background(
         try:
             return answers.get(timeout=ESCALATION_TIMEOUT_SECONDS)
         except queue.Empty:
-            # Raising is what keeps the thread from hanging on a tab nobody
-            # came back to. The Controller sees the hook fail rather than
-            # return a made-up answer -- which is the same outcome as the user
-            # declining to choose, and never an option they did not pick.
-            raise EscalationTimeout(
-                f"No answer within {ESCALATION_TIMEOUT_SECONDS}s: {question.text}"
-            ) from None
+            # Exactly what the Stop button posts. The Controller reads it as
+            # "no option was chosen" and ends the run itself, so the summary --
+            # the rounds and the money already spent -- still comes back.
+            # Raising instead would abort run_task from the inside and destroy
+            # that summary in order to report that nobody clicked. Never a made
+            # up answer either way; the timeout is carried by the flag below.
+            timed_out.set()
+            return NO_ANSWER
 
     try:
         summary = run_task(
@@ -152,9 +157,7 @@ def _run_in_background(
             # the code worker can touch.
             allow_code_worker=True,
         )
-        outbox.put((FINISHED, summary))
-    except EscalationTimeout as exc:
-        outbox.put((FAILED, {"error": redact_exc(exc, *keys.secrets()), "timeout": True}))
+        outbox.put((FINISHED, {**summary, "escalation_timed_out": timed_out.is_set()}))
     except Exception as exc:
         # Everything a provider raises passes through here on its way to the
         # screen. A vendor that echoes the offending request back puts the
@@ -302,7 +305,8 @@ def _request_stop() -> None:
     unanswered question for the full timeout -- the Controller cannot read the
     latch while it is inside the escalation hook. Feeding the queue an empty
     answer releases it into the Controller's own stop path, which ends the run
-    with a proper summary instead of an exception.
+    with a proper summary instead of an exception. The escalation timeout takes
+    the same route, for the same reason.
     """
     stop_flag = st.session_state["stop_flag"]
     if stop_flag is not None:
@@ -667,6 +671,13 @@ def _render_outcome() -> None:
     st.subheader(f"{icon} {label}")
     if blurb:
         st.caption(blurb)
+    if summary.get("escalation_timed_out"):
+        # Said out loud, because the status alone reads as a deliberate stop.
+        # The result below is still real and still cost what it cost.
+        st.info(
+            f"A question went unanswered for {ESCALATION_TIMEOUT_SECONDS:.0f}s, so the run "
+            "ended itself. Everything below is what it had reached by then."
+        )
 
     score, rounds, cost = st.columns(3)
     score.metric("Final Score", summary["score"] if summary["score"] is not None else "—")

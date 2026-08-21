@@ -196,11 +196,16 @@ arithmetic, and no escalation policy — those stay in `controller.py`, and
 | `POST /task/{id}/stop` | Sets the cancel latch, and posts an empty answer too, since a run parked on a question is not reading the latch. |
 
 An escalation that goes unanswered for `ESCALATION_TIMEOUT_SECONDS` (300s, shared
-with the Streamlit app in [escalation.py](escalation.py)) ends the run: status
-`failed`, `timed_out: true`, and the credentials released. `timed_out` is its own
-field because "nobody came back" and "a provider broke" call for different
-reactions, and because the stop endpoint posts an empty answer -- so an empty
-answer cannot also mean a timeout.
+with the Streamlit app in [escalation.py](escalation.py)) ends the run the same
+way `/stop` does: the surface hands the Controller an empty answer, the loop
+reaches its own ending, and `GET /task/{id}` returns `status: finished` with the
+**full summary** — rounds, spend, and whatever output had been reached — plus
+`timed_out: true`. The credentials are released either way.
+
+`timed_out` is a flag next to the result rather than a different kind of exit,
+and that is the whole point: raising out of the escalation hook would abort
+`run_task` from the inside and destroy the summary it was about to return, so a
+caller who stepped away would lose work that had already been paid for.
 
 ```bash
 curl -s localhost:8000/task -H 'content-type: application/json' -d '{

@@ -12,11 +12,20 @@ lives here rather than in either surface because ``app.py`` and ``api.py`` must
 agree on it and neither can import the other -- the Streamlit app would drag
 Streamlit into the API process, and the API would drag FastAPI into the UI.
 
-Both surfaces raise ``EscalationTimeout`` rather than returning an empty answer.
-The difference matters to whoever is reading the result afterwards: an empty
-answer is indistinguishable from someone deliberately choosing to stop, and
-"nobody was there" is a different fact about the run than "the operator ended
-it". Neither is turned into a default choice; the run ends either way.
+On expiry a surface returns the *empty answer* -- exactly what its stop control
+posts -- and records the timeout as a flag of its own. It does not raise.
+
+The reason is not stylistic. Raising aborts ``run_task`` from the inside, so
+the summary it was about to return is destroyed: the rounds, the
+spend, and whatever output had already been accepted all go with it. The user
+loses work that was already paid for, in order to report that nobody clicked a
+button. Returning the empty answer lets the loop reach its own ending -- the
+Controller reads "no answer" as stop, which is what it means -- and hand back a
+complete summary.
+
+"Nobody was there" is still a different fact from "the operator ended it", and
+both surfaces keep it. It travels as a flag next to the result rather than as
+the shape of the exit, which is the only way to keep the result at all.
 """
 
 from __future__ import annotations
@@ -26,11 +35,7 @@ from __future__ import annotations
 ESCALATION_TIMEOUT_SECONDS = 300.0
 
 
-class EscalationTimeout(RuntimeError):
-    """Nobody answered an escalation before the surface gave up waiting.
-
-    Raised by the ``on_escalation`` hook, which means it surfaces out of
-    ``run_task`` to whoever called it. Every front end catches it on the way to
-    its own terminal record -- and, importantly, on the way to releasing the
-    credentials the run was holding.
-    """
+# The answer a surface hands back when nobody replied in time. Deliberately the
+# same value the stop controls post: to the Controller both mean "no option was
+# chosen", and it already knows what to do with that.
+NO_ANSWER = ""
