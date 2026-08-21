@@ -163,6 +163,8 @@ git-ignored; `.env.example` is the template and holds no values.
 | `make lint` | Byte-compile every source file |
 | `make check` | `lint` then `test` — the pre-commit gate |
 | `make run` | Live smoke run at a small budget (needs `.env`; **costs money**) |
+| `make ui` | Streamlit observer over the same `run_task` |
+| `make serve` | HTTP API on `127.0.0.1:8000` — keys arrive per request, not from `.env` |
 | `make clean` | Drop bytecode caches and self-check logs, keep real run logs |
 | `make distclean` | Also drop every run log and the venv |
 
@@ -175,6 +177,67 @@ controller.py GOAL [--context TEXT] [--max-rounds N]
 
 `--cwd` sets the working directory for the code Worker. Exit code is 0 when the
 run was accepted (by the Critic or by the user), 1 otherwise.
+
+---
+
+## HTTP API
+
+`make serve` puts the same `run_task` behind three endpoints. Like the
+Streamlit app, it is an observer: it starts a run, relays progress, carries one
+answer back, and reports the summary. It owns no round counting, no budget
+arithmetic, and no escalation policy — those stay in `controller.py`, and
+`self_check` asserts that `api.py` has not grown a copy of them.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /task` | Credentials, goal, and ceilings in the body. Returns `202` and a `task_id` immediately. |
+| `GET /task/{id}` | Status, the progress events so far, an open question if there is one, and the summary once it finishes. |
+| `POST /task/{id}/answer` | Answers an escalation with an **option label** — the text the caller was shown, not an index. |
+| `POST /task/{id}/stop` | Sets the cancel latch, and posts an empty answer too, since a run parked on a question is not reading the latch. |
+
+```bash
+curl -s localhost:8000/task -H 'content-type: application/json' -d '{
+  "goal": "Write a two-sentence summary of what a multi-model orchestrator does.",
+  "budget_usd": 0.25,
+  "keys": {"xai": "...", "anthropic": "...", "google": "..."}
+}'
+# {"task_id":"a1b2c3d4e5f6","status":"running"}
+
+curl -s localhost:8000/task/a1b2c3d4e5f6
+```
+
+### Keys are per request
+
+Credentials arrive in the body of `POST /task`, live in that task's record for
+as long as the run does, and are dropped when it ends. They are never logged,
+never written to disk, never returned by any endpoint, and never part of the
+OpenAPI document. `ApiKeys.__repr__` prints `set`/`missing`, so one landing in
+a traceback frame does not print itself.
+
+That "dropped" is a dropped reference, not a wiped buffer: Python strings are
+immutable and nothing here can overwrite one in place. It bounds how long the
+value is reachable, which is the real risk; it is not a guarantee about process
+memory and is not described as one anywhere in the code.
+
+### Do not deploy this without TLS
+
+It binds `127.0.0.1` and refuses to pretend that is a limitation to be removed
+later. **API keys travel in the request body**, so a plaintext listener on any
+reachable interface publishes three credentials to anyone on the path. Passing
+`--host` prints a warning and does not make it safe.
+
+Before this is reachable from anywhere else it needs, at minimum: TLS
+terminated in front of it, authentication of its own (it has none — anyone who
+can reach it can start a run), and a bound on how many tasks one caller may
+create. None of that is implemented.
+
+### What it does not do
+
+State is a dict in memory. There is no database, no Redis, and no broker,
+because those buy durability across restarts — **a restart loses every
+in-flight run**, and the records of finished ones. Tasks accumulate for the
+life of the process; nothing evicts them. That is the honest shape of a
+single-node service, written down rather than discovered.
 
 ---
 
@@ -207,6 +270,9 @@ either prints `all good` or names what broke.
 
 ```
 controller.py           the loop: rounds, budget checks, escalation, logging
+api.py                  HTTP surface over run_task -- observer only, no logic
+app.py                  Streamlit surface over run_task -- observer only, no logic
+keys.py                 ApiKeys: the only module that reads the environment
 schemas.py              Pydantic contracts — also the source of every vendor schema
 budget.py               per-call cost accounting and the ceiling
 roles/
@@ -223,6 +289,7 @@ providers/
     claude_code.py      headless subprocess, never raises
     schema_utils.py     one Pydantic model → three dialects
     retry_utils.py      retry what waiting fixes, fail fast on the rest
+    redact.py           scrub credentials out of anything about to be shown
 scripts/
     self_check.py       the offline gate
 runs/                   one JSONL file per run (git-ignored)

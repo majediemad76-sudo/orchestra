@@ -22,9 +22,13 @@ FIXTURE_FLAGS  ?=
 CRITIC_BUDGET  ?= 0.50
 CRITIC_FLAGS   ?=
 GOAL       ?= Write a two-sentence description of what this orchestrator does.
+# HTTP surface. Loopback by default and deliberately so: keys travel in the
+# request body, so any other interface needs TLS terminated in front of it.
+API_HOST   ?= 127.0.0.1
+API_PORT   ?= 8000
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test check ruff lint typecheck run ui eval fixture eval-critic clean distclean
+.PHONY: help venv install test check ruff lint typecheck run ui serve eval fixture eval-critic clean distclean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -56,6 +60,9 @@ run: ## Live smoke run against the real APIs -- costs money, needs .env
 
 ui: ## Launch the Streamlit observer UI
 	./.venv/bin/streamlit run app.py
+
+serve: ## Serve the orchestrator over HTTP on 127.0.0.1 (keys come per request, not from .env)
+	$(PY) api.py --host $(API_HOST) --port $(API_PORT)
 
 eval: ## Run the eval suite against the live APIs -- costs money, needs .env
 	@test -f .env || { echo "no .env -- copy .env.example and fill in the keys"; exit 1; }

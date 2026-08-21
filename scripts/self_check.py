@@ -1314,6 +1314,180 @@ def check_canary_never_escapes() -> None:
     check(re.search(r"\[REDACTED\]", scrubbed) is not None, "redaction leaves a visible marker")
 
 
+def check_http_api() -> None:
+    """Drive the HTTP surface with fake roles: no network, no keys, no spend.
+
+    The API is an observer, so what is worth asserting is not that it can run a
+    task -- the Controller does that -- but that it never becomes a second
+    source of truth and never leaks the credentials it now holds. Both are
+    things a reader cannot verify by looking.
+    """
+    print("\n[15] HTTP API (fake roles)")
+    import json as _json
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    import api
+    import controller
+    from providers import ProviderResult
+
+    saved = (
+        controller.manager_role.plan,
+        controller.worker_role.execute,
+        controller.critic_role.review,
+    )
+    saved_runs = controller.RUNS_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="orchestrator-api-"))
+    controller.RUNS_DIR = tmp
+    seen: dict[str, int] = {"manager": 0, "keys_threaded": 0}
+
+    try:
+        def fake_plan(task, previous_plan=None, verdict=None, worker_result="", **kw):
+            seen["manager"] += 1
+            seen["keys_threaded"] += int("keys" in kw)
+            asks = task.context == "ask" and seen["manager"] == 1
+            return (
+                ManagerPlan(
+                    plan="p",
+                    worker_prompt="w",
+                    acceptance_criteria=[CRITICAL_CRITERION],
+                    worker_type="text",
+                    needs_user_input=asks,
+                    question=Question(text="which tone?", options=["formal", "casual"])
+                    if asks
+                    else None,
+                ),
+                ProviderResult(data={}, model="grok-4.6", input_tokens=10, output_tokens=10),
+            )
+
+        def fake_worker(plan, cwd=None, **kw):
+            seen["keys_threaded"] += int("keys" in kw)
+            return controller.worker_role.WorkerRun(
+                output=WorkerOutput(result="fake result"),
+                model="claude-sonnet-5",
+                input_tokens=10,
+                output_tokens=10,
+            )
+
+        def fake_review(plan, output, **kw):
+            seen["keys_threaded"] += int("keys" in kw)
+            return (
+                CriticVerdict(
+                    checks=[
+                        CriterionCheck(
+                            criterion=CRITICAL_CRITERION.text,
+                            passed=True,
+                            critical=True,
+                            evidence="fake result",
+                            reason="fake",
+                        )
+                    ],
+                    verdict="accept",
+                ),
+                ProviderResult(
+                    data={}, model="gemini-3.1-flash-lite", input_tokens=10, output_tokens=10
+                ),
+            )
+
+        controller.manager_role.plan = fake_plan
+        controller.worker_role.execute = fake_worker
+        controller.critic_role.review = fake_review
+
+        client = TestClient(api.app)
+        bundle = {"xai": CANARY_KEY, "anthropic": CANARY_KEY, "google": CANARY_KEY}
+
+        def wait_for(task_id: str, wanted: set[str], limit: float = 20.0) -> dict[str, Any]:
+            deadline = _time.time() + limit
+            body: dict[str, Any] = {}
+            while _time.time() < deadline:
+                body = client.get(f"/task/{task_id}").json()
+                if body["status"] in wanted:
+                    return body
+                _time.sleep(0.02)
+            check(False, f"timed out waiting for {wanted}; last was {body.get('status')}")
+            return body
+
+        # 1. A run starts and finishes, and the response is an id rather than a result.
+        created = client.post("/task", json={"goal": "g", "budget_usd": 1.0, "keys": bundle})
+        check(created.status_code == 202, "POST /task accepts with 202, not 200")
+        task_id = created.json()["task_id"]
+        done = wait_for(task_id, {"finished", "failed"})
+        check(done["status"] == "finished", "the run reaches finished")
+        check(done["summary"]["status"] == "accepted", "the summary is the Controller's, untouched")
+        check(
+            [e["event"] for e in done["events"]][:2] == ["round_start", "manager_plan"],
+            "progress events are relayed in order",
+        )
+        check(seen["keys_threaded"] >= 3, "keys reached all three roles through run_task")
+
+        # 2. Nothing anywhere in the response carries the credential.
+        check(CANARY_KEY not in _json.dumps(done), "GET /task never echoes a key")
+        check(
+            CANARY_KEY not in _json.dumps(client.get("/openapi.json").json()),
+            "the OpenAPI document never carries a key",
+        )
+        record = api._TASKS[task_id]
+        check(record.keys.secrets() == (), "the record's keys are cleared once the run ends")
+        check(CANARY_KEY not in repr(record.keys), "the cleared record still reprs safely")
+        for path in tmp.rglob("*.jsonl"):
+            check(CANARY_KEY not in path.read_text(encoding="utf-8"), f"runs/{path.name} is clean")
+
+        # 3. The escalation round trip: question out, label in, run resumes.
+        seen["manager"] = 0
+        created = client.post(
+            "/task", json={"goal": "g", "context": "ask", "budget_usd": 1.0, "keys": bundle}
+        )
+        ask_id = created.json()["task_id"]
+        waiting = wait_for(ask_id, {"waiting_for_answer"})
+        check(waiting["question"]["options"] == ["formal", "casual"], "the question is exposed")
+        answered = client.post(f"/task/{ask_id}/answer", json={"answer": "formal"})
+        check(answered.status_code == 200, "an option label is accepted")
+        resumed = wait_for(ask_id, {"finished", "failed"})
+        check(resumed["status"] == "finished", "the run resumes after the answer")
+        check(
+            client.post(f"/task/{ask_id}/answer", json={"answer": "formal"}).status_code == 409,
+            "answering a finished task is a conflict, not a silent no-op",
+        )
+
+        # 4. Stop reaches a run that is parked on a question -- the latch alone
+        #    cannot, because nothing is reading it while the thread blocks.
+        seen["manager"] = 0
+        created = client.post(
+            "/task", json={"goal": "g", "context": "ask", "budget_usd": 1.0, "keys": bundle}
+        )
+        stop_id = created.json()["task_id"]
+        wait_for(stop_id, {"waiting_for_answer"})
+        check(client.post(f"/task/{stop_id}/stop").status_code == 200, "stop is accepted")
+        stopped = wait_for(stop_id, {"finished", "failed"})
+        check(
+            stopped["summary"]["status"] == "escalated_unanswered",
+            "stopping at a question ends the run without inventing an answer",
+        )
+
+        # 5. Unknown ids are 404, not 500 or an empty record.
+        check(client.get("/task/nope").status_code == 404, "an unknown task id is a 404")
+        check(
+            client.post("/task/nope/answer", json={"answer": "x"}).status_code == 404,
+            "answering an unknown task id is a 404",
+        )
+
+        # 6. The API must not have grown a policy of its own.
+        source = (ROOT / "api.py").read_text(encoding="utf-8")
+        for banned in ("max_rounds >", "consecutive_rejections", "two_rejections", "spent_usd >"):
+            check(banned not in source, f"api.py contains no orchestration logic ({banned})")
+    finally:
+        (
+            controller.manager_role.plan,
+            controller.worker_role.execute,
+            controller.critic_role.review,
+        ) = saved
+        controller.RUNS_DIR = saved_runs
+        with api._LOCK:
+            api._TASKS.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print("self check -- no API keys required, no network calls")
     check_pydantic_models()
@@ -1330,6 +1504,7 @@ def main() -> int:
     check_retry_policy()
     check_no_hardcoded_keys()
     check_canary_never_escapes()
+    check_http_api()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:
