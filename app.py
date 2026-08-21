@@ -46,6 +46,7 @@ from dotenv import load_dotenv
 
 from budget import SUBSCRIPTION_EQUIVALENT
 from controller import run_task
+from escalation import ESCALATION_TIMEOUT_SECONDS, EscalationTimeout
 from keys import ApiKeys
 from providers.redact import redact_exc
 from schemas import Question, Task
@@ -66,11 +67,6 @@ POLL_SECONDS = 0.4
 FINISHED = "_finished"
 FAILED = "_failed"
 ESCALATION = "_escalation"
-
-# How long the worker thread waits for a human before giving up. Long enough
-# to read a question and think; short enough that a forgotten tab does not
-# leave a thread parked forever.
-ESCALATION_TIMEOUT_SECONDS = 300
 
 # Keyed by provider, which is what ApiKeys speaks; the environment variable
 # name comes from keys.ENV_VARS so the two cannot drift apart.
@@ -100,10 +96,6 @@ COST_BASIS_NOTE = (
     "at API rates. On a personal Claude plan it draws on included usage, so it "
     "was not billed against API credit."
 )
-
-
-class EscalationTimeout(RuntimeError):
-    """Nobody answered an escalation within the timeout."""
 
 
 def _run_in_background(

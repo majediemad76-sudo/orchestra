@@ -1334,6 +1334,7 @@ def check_http_api() -> None:
     print("\n[15] HTTP API (fake roles)")
     import json as _json
     import time as _time
+    from unittest.mock import patch
 
     from fastapi.testclient import TestClient
 
@@ -1474,14 +1475,38 @@ def check_http_api() -> None:
             "stopping at a question ends the run without inventing an answer",
         )
 
-        # 5. Unknown ids are 404, not 500 or an empty record.
+        # 5. Nobody answers. The run must end on its own, write one terminal
+        #    record, and let go of the credentials -- a task parked forever on a
+        #    question is also a task holding three keys forever.
+        seen["manager"] = 0
+        with patch.object(api, "ESCALATION_TIMEOUT_SECONDS", 0.25):
+            created = client.post(
+                "/task", json={"goal": "g", "context": "ask", "budget_usd": 1.0, "keys": bundle}
+            )
+            silent_id = created.json()["task_id"]
+            timed = wait_for(silent_id, {"finished", "failed"})
+        check(timed["status"] == "failed", "an unanswered escalation ends the run")
+        check(timed["timed_out"] is True, "the record says it timed out, not merely failed")
+        check(
+            "No answer within" in (timed["error"] or ""),
+            "the error names the cause rather than leaving a bare exception",
+        )
+        check(timed["question"] is None, "the stale question is cleared")
+        silent = api._TASKS[silent_id]
+        check(
+            silent.keys.secrets() == (),
+            "the timed-out run released its credentials in the finally",
+        )
+        check(CANARY_KEY not in _json.dumps(timed), "the timeout record carries no key")
+
+        # 6. Unknown ids are 404, not 500 or an empty record.
         check(client.get("/task/nope").status_code == 404, "an unknown task id is a 404")
         check(
             client.post("/task/nope/answer", json={"answer": "x"}).status_code == 404,
             "answering an unknown task id is a 404",
         )
 
-        # 6. The API must not have grown a policy of its own.
+        # 7. The API must not have grown a policy of its own.
         source = (ROOT / "api.py").read_text(encoding="utf-8")
         for banned in ("max_rounds >", "consecutive_rejections", "two_rejections", "spent_usd >"):
             check(banned not in source, f"api.py contains no orchestration logic ({banned})")

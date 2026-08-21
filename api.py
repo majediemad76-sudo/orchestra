@@ -43,14 +43,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from controller import run_task
+from escalation import ESCALATION_TIMEOUT_SECONDS, EscalationTimeout
 from keys import ApiKeys
 from providers.redact import redact_exc
 from schemas import Question, Task
-
-# How long the run thread waits at an escalation before giving up. The same
-# ceiling app.py uses, for the same reason: a caller that never comes back must
-# not park a thread forever.
-ANSWER_TIMEOUT_SECONDS = 300.0
 
 # Loopback only. Changing this without terminating TLS in front is how the keys
 # in POST /task end up on the wire in plaintext.
@@ -111,6 +107,11 @@ class TaskState(BaseModel):
     question: PendingQuestion | None = None
     summary: dict[str, Any] | None = None
     error: str | None = None
+    # Set when the run ended because nobody answered an escalation. A separate
+    # field because a poller cannot otherwise tell "no one was there" from "a
+    # provider broke", and the two call for different reactions: come back and
+    # answer, versus look at what failed.
+    timed_out: bool = False
 
 
 class AnswerRequest(BaseModel):
@@ -136,6 +137,7 @@ class TaskRecord:
         self.question: PendingQuestion | None = None
         self.summary: dict[str, Any] | None = None
         self.error: str | None = None
+        self.timed_out = False
         self.answers: queue.Queue[str] = queue.Queue()
         self.stop_flag = threading.Event()
         # Held only while the run needs them. Cleared in the thread's finally.
@@ -151,6 +153,7 @@ class TaskRecord:
             question=self.question,
             summary=self.summary,
             error=self.error,
+            timed_out=self.timed_out,
         )
 
 
@@ -195,11 +198,16 @@ def _run(record: TaskRecord, task: Task, cwd: str | None) -> None:
             )
             record.status = "waiting_for_answer"
         try:
-            answer = record.answers.get(timeout=ANSWER_TIMEOUT_SECONDS)
+            answer = record.answers.get(timeout=ESCALATION_TIMEOUT_SECONDS)
         except queue.Empty:
-            # Treated as no answer, which the Controller reads as stop. It is
-            # deliberately not turned into a default choice: nobody picked one.
-            answer = ""
+            # Raised rather than returned as an empty answer, matching app.py.
+            # An empty answer is what the *stop* endpoint posts, so returning
+            # one here would make "nobody came back" indistinguishable from
+            # "the caller ended it" in the record afterwards. Either way the
+            # run ends; neither becomes a default choice.
+            raise EscalationTimeout(
+                f"No answer within {ESCALATION_TIMEOUT_SECONDS:.0f}s: {question.text}"
+            ) from None
         finally:
             with _LOCK:
                 record.question = None
@@ -225,6 +233,11 @@ def _run(record: TaskRecord, task: Task, cwd: str | None) -> None:
         with _LOCK:
             record.summary = summary
             record.status = "finished"
+    except EscalationTimeout as exc:
+        with _LOCK:
+            record.error = str(exc)
+            record.timed_out = True
+            record.status = "failed"
     except BaseException as exc:
         # Broad on purpose: whatever went wrong, the poller must get exactly one
         # terminal record or it waits forever on a thread that is already gone.

@@ -195,6 +195,13 @@ arithmetic, and no escalation policy — those stay in `controller.py`, and
 | `POST /task/{id}/answer` | Answers an escalation with an **option label** — the text the caller was shown, not an index. |
 | `POST /task/{id}/stop` | Sets the cancel latch, and posts an empty answer too, since a run parked on a question is not reading the latch. |
 
+An escalation that goes unanswered for `ESCALATION_TIMEOUT_SECONDS` (300s, shared
+with the Streamlit app in [escalation.py](escalation.py)) ends the run: status
+`failed`, `timed_out: true`, and the credentials released. `timed_out` is its own
+field because "nobody came back" and "a provider broke" call for different
+reactions, and because the stop endpoint posts an empty answer -- so an empty
+answer cannot also mean a timeout.
+
 ```bash
 curl -s localhost:8000/task -H 'content-type: application/json' -d '{
   "goal": "Write a two-sentence summary of what a multi-model orchestrator does.",
