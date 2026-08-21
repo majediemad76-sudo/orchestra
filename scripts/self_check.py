@@ -1152,9 +1152,17 @@ def check_no_hardcoded_keys() -> None:
     # bug now: a provider that can reach os.environ cannot serve two callers
     # with different keys, and will quietly use the wrong one instead of
     # failing. Reading the environment is the entry point's job.
+    # claude_code.py is the one exception, and it is the opposite of a
+    # loophole: it reads the environment in order to build a small allowlist and
+    # hand the subprocess *that* instead of everything this process holds. A
+    # source-text rule cannot tell that apart from a credential lookup, so the
+    # rule is replaced for this file by the behavioural checks in section [16].
+    ENV_READER_BY_DESIGN = {"claude_code.py"}
     provider_sources = [p for p in sources if p.parts[-2] == "providers"]
     check(bool(provider_sources), "there are provider modules to inspect")
     for path in provider_sources:
+        if path.name in ENV_READER_BY_DESIGN:
+            continue
         body = path.read_text(encoding="utf-8")
         check(
             "os.environ" not in body and "getenv" not in body,
@@ -1171,8 +1179,9 @@ def check_no_hardcoded_keys() -> None:
         if env_call.search(p.read_text(encoding="utf-8"))
     )
     check(
-        readers == ["keys.py"],
-        f"the environment is read in keys.py and nowhere else -> {readers}",
+        readers == ["keys.py", "providers/claude_code.py"],
+        "the environment is read only in keys.py and in the subprocess allowlist "
+        f"-> {readers}",
     )
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     check(
@@ -1488,6 +1497,104 @@ def check_http_api() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_code_worker_isolation() -> None:
+    """The code worker's environment, and the gate in front of it. Offline.
+
+    Two claims that a reader cannot verify by looking, and that a source-text
+    rule cannot check either:
+
+      * the subprocess is handed an explicit allowlist, so no credential in this
+        process reaches a program that can write files and run commands,
+      * with the gate closed, the code path is not merely refused at the end --
+        it is never entered, so ``subprocess.run`` is never reached at all.
+
+    The second is the one worth driving rather than asserting. A refusal placed
+    one line too late still runs the subprocess.
+    """
+    print("\n[16] Code worker isolation")
+    from unittest.mock import patch
+
+    from providers import claude_code
+    from roles import worker as worker_role
+
+    # 1. The allowlist keeps what the CLI needs and drops what it must not see.
+    poisoned = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/someone",
+        "LANG": "en_US.UTF-8",
+        "XAI_API_KEY": CANARY_KEY,
+        "ANTHROPIC_API_KEY": CANARY_KEY,
+        "GOOGLE_API_KEY": CANARY_KEY,
+        "AWS_SECRET_ACCESS_KEY": CANARY_KEY,
+        "SOME_OTHER_TOKEN": CANARY_KEY,
+    }
+    with patch.dict("os.environ", poisoned, clear=True):
+        env = claude_code.child_env()
+    check(env.get("PATH") == "/usr/bin", "PATH is passed through")
+    check(env.get("HOME") == "/home/someone", "HOME is passed through")
+    for name in claude_code.FORBIDDEN_ENV:
+        check(name not in env, f"{name} is not in the subprocess environment")
+    check(
+        CANARY_KEY not in "\x00".join(env.values()),
+        "no value in the subprocess environment carries a credential",
+    )
+    extra = sorted(set(env) - set(claude_code.INHERITED_ENV))
+    check(not extra, f"nothing outside the allowlist leaks in -> {extra}")
+    check(
+        "AWS_SECRET_ACCESS_KEY" not in env and "SOME_OTHER_TOKEN" not in env,
+        "unrelated secrets in the parent environment are dropped too",
+    )
+
+    # 2. A key name added to the allowlist by mistake is still dropped.
+    mistaken = (*claude_code.INHERITED_ENV, "GOOGLE_API_KEY")
+    with (
+        patch.object(claude_code, "INHERITED_ENV", mistaken),
+        patch.dict("os.environ", poisoned, clear=True),
+    ):
+        env2 = claude_code.child_env()
+    check("GOOGLE_API_KEY" not in env2, "a key name allowlisted by mistake is still removed")
+
+    # 3. The gate: closed means the subprocess is never reached.
+    code_plan = ManagerPlan(
+        plan="p",
+        worker_prompt="edit the file",
+        acceptance_criteria=[CRITICAL_CRITERION],
+        worker_type="code",
+    )
+    with patch.object(claude_code, "run") as never:
+        run = worker_role.execute(code_plan, keys=FAKE_KEYS, allow_code_worker=False)
+    check(not never.called, "with the gate closed, claude_code.run is never called")
+    check(run.output.ok is False, "the refusal comes back as a failed WorkerRun")
+    check(bool(run.failure_reason), "the refusal carries a reason the Manager can act on")
+    check(
+        "text worker" in run.failure_reason,
+        "the reason tells the Manager what to do instead, not just that it failed",
+    )
+    check(CANARY_KEY not in run.failure_reason, "the reason carries no credential")
+
+    # 4. Default is closed. A caller that says nothing does not get the filesystem.
+    with patch.object(claude_code, "run") as never_either:
+        default_run = worker_role.execute(code_plan, keys=FAKE_KEYS)
+    check(not never_either.called, "the code path is off by default, not on")
+    check(default_run.output.ok is False, "the default refusal is a failed WorkerRun too")
+
+    # 5. Open means it really does run -- otherwise this whole check could pass
+    #    against a worker that had simply lost the ability to run code.
+    with patch.object(claude_code, "run", return_value=claude_code.CodeResult(
+        ok=True, result="done", num_turns=2, cost_usd=0.01
+    )) as called:
+        allowed = worker_role.execute(code_plan, keys=FAKE_KEYS, allow_code_worker=True)
+    check(called.called, "with the gate open, the code worker is actually invoked")
+    check(allowed.output.ok is True, "an allowed code run comes back ok")
+
+    # 6. The refusal is a normal rejected round, not a new exception type.
+    from roles import critic as critic_role
+
+    verdict = critic_role.failed_worker_verdict(run.failure_reason, [CRITICAL_CRITERION])
+    check(verdict.accepted is False, "the refusal becomes a rejection the loop understands")
+    check(len(verdict.checks) == 1, "the synthetic verdict still covers every criterion")
+
+
 def main() -> int:
     print("self check -- no API keys required, no network calls")
     check_pydantic_models()
@@ -1505,6 +1612,7 @@ def main() -> int:
     check_no_hardcoded_keys()
     check_canary_never_escapes()
     check_http_api()
+    check_code_worker_isolation()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:

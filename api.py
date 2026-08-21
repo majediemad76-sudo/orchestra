@@ -215,6 +215,12 @@ def _run(record: TaskRecord, task: Task, cwd: str | None) -> None:
             on_escalation=on_escalation,
             stop_flag=record.stop_flag,
             keys=keys,
+            # Off, and stated rather than left to the default. An HTTP caller
+            # is not the operator of this host: nothing in a request body
+            # should be able to write files here. A goal the Manager reads as
+            # a coding task comes back as a rejected round with a reason, and
+            # the loop re-plans it for the text worker.
+            allow_code_worker=False,
         )
         with _LOCK:
             record.summary = summary

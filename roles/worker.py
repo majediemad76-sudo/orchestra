@@ -46,15 +46,43 @@ class WorkerRun:
     failure_reason: str = ""
 
 
-def execute(plan: ManagerPlan, cwd: str | None = None, *, keys: ApiKeys) -> WorkerRun:
-    """Run the plan on whichever backend it asked for.
+def execute(
+    plan: ManagerPlan,
+    cwd: str | None = None,
+    *,
+    keys: ApiKeys,
+    allow_code_worker: bool = False,
+) -> WorkerRun:
+    """Run the plan on whichever backend it asked for, if that backend is allowed.
 
     ``keys`` is required even for the code path, which does not use it: the
     Manager picks the backend at runtime, so a caller cannot know in advance
     which one will need a credential. Making it conditional would move that
     failure from the call site to the middle of a paid round.
+
+    ``allow_code_worker`` defaults to *off*, and the default is the point. The
+    code backend writes files and runs commands on the host; the Manager, not
+    the caller, decides when to reach for it. A caller that has not said yes --
+    an HTTP request from someone who only asked for text -- must not be able to
+    get there by phrasing a goal that sounds like a coding task.
+
+    Refusal is a rejection, not an exception: ``ok=False`` with a reason, which
+    ``critic.failed_worker_verdict`` turns into a normal rejected round. The
+    Manager sees why and can re-plan the same task as text, which is a better
+    outcome than a traceback and a lost run.
     """
     if plan.worker_type == "code":
+        if not allow_code_worker:
+            return WorkerRun(
+                output=WorkerOutput(result="", ok=False),
+                model=CODE_MODEL,
+                failure_reason=(
+                    "the code worker is disabled for this caller; it can read and write "
+                    "files on the host. Re-plan this task for the text worker: produce "
+                    "the answer, or the file contents, directly in the response instead "
+                    "of editing anything."
+                ),
+            )
         return _execute_code(plan, cwd=cwd)
     return _execute_text(plan, keys=keys)
 

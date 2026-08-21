@@ -206,6 +206,10 @@ def run_one(spec: dict[str, Any], suite_id: str, keys: ApiKeys) -> TaskResult:
             ask=_no_escalation,
             run_id=f"eval-{suite_id}-{spec['id']}",
             keys=keys,
+            # Left off deliberately. A benchmark that edits the working tree
+            # changes the thing it is measuring, and every task in the suite is
+            # a text task; a code plan here would be the harness misbehaving.
+            allow_code_worker=False,
         )
     except Exception as exc:
         outcome.status = "crashed"

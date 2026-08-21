@@ -18,6 +18,7 @@ wall-clock, the turn cap bounds spend, and neither is left to the model.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -26,6 +27,57 @@ from typing import Any
 DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_TURNS = 15
 CLI = "claude"
+
+# Everything the child is allowed to inherit, by name. An allowlist rather than
+# a denylist because the failure modes are not symmetric: forgetting to allow a
+# variable makes the CLI misbehave visibly and gets fixed, while forgetting to
+# deny one hands a credential to a subprocess and nobody finds out.
+#
+# The three provider key variables are absent and must stay absent. Two reasons,
+# and the second is the one that is easy to miss:
+#
+#   1. This subprocess has no use for them. It authenticates through the CLI's
+#      own login under HOME.
+#   2. ANTHROPIC_API_KEY in particular would silently switch the CLI from the
+#      user's subscription to API-key billing -- changing what the run costs and
+#      which cost_basis the log should have claimed.
+INHERITED_ENV = (
+    "PATH",       # find the CLI and whatever it shells out to
+    "HOME",       # ~/.claude: login, settings, MCP config
+    "USER",
+    "LOGNAME",
+    "SHELL",      # the CLI runs commands through it
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TERM",
+    "SSL_CERT_FILE",   # custom CA bundles, where a proxy demands one
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "__CF_USER_TEXT_ENCODING",  # macOS; its absence makes Python/node warn
+)
+
+# Named so the check in self_check and the reader agree on what must never be
+# forwarded, without either restating the list.
+FORBIDDEN_ENV = ("XAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")
+
+
+def child_env() -> dict[str, str]:
+    """The environment the subprocess gets: an allowlist, not the parent's.
+
+    ``subprocess.run`` with no ``env`` hands the child everything this process
+    holds, which now includes credentials belonging to whichever HTTP caller
+    happens to be running. Those must not reach a program that can write files
+    and run commands.
+    """
+    env = {name: os.environ[name] for name in INHERITED_ENV if name in os.environ}
+    # Belt and braces. If a key name is ever added to INHERITED_ENV by mistake,
+    # this drops it rather than trusting the review that let it through.
+    for name in FORBIDDEN_ENV:
+        env.pop(name, None)
+    return env
 
 
 @dataclass
@@ -83,6 +135,7 @@ def run(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         # The expensive failure, and the one worth naming precisely: work was

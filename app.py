@@ -155,6 +155,10 @@ def _run_in_background(
             on_escalation=on_escalation,
             stop_flag=stop_flag,
             keys=keys,
+            # Streamlit here is a local operator's console, the same trust
+            # position as the terminal CLI: whoever launched it owns the files
+            # the code worker can touch.
+            allow_code_worker=True,
         )
         outbox.put((FINISHED, summary))
     except EscalationTimeout as exc:

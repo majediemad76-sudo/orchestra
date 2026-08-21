@@ -263,6 +263,7 @@ def run_task(
     stop_flag: threading.Event | None = None,
     *,
     keys: ApiKeys,
+    allow_code_worker: bool = False,
 ) -> dict[str, Any]:
     """Run the Manager/Worker/Critic loop to acceptance, exhaustion or halt.
 
@@ -291,6 +292,12 @@ def run_task(
     here: this function is called both by a single-user CLI and by an HTTP
     server handling one caller's credentials per request, and only the caller
     knows which. Nothing in this module or below it touches ``os.environ``.
+
+    ``allow_code_worker`` is off unless the caller opts in. The code backend
+    touches the filesystem, so the decision belongs to whoever launched the run
+    -- not to the Manager, which picks a backend from the goal alone. When it is
+    off and the Manager asks for code, the round is rejected with a reason and
+    the loop re-plans; nothing raises.
     """
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     run_id = run_id or f"{stamp}-{uuid.uuid4().hex[:6]}"
@@ -420,7 +427,9 @@ def run_task(
             continue
 
         # --- Worker --------------------------------------------------------
-        run = worker_role.execute(plan, cwd=cwd, keys=keys)
+        run = worker_role.execute(
+            plan, cwd=cwd, keys=keys, allow_code_worker=allow_code_worker
+        )
         if run.cost_usd is not None:
             # Only Claude Code headless reports dollars directly, and on a
             # personal subscription that figure is API-equivalent rather than
@@ -618,7 +627,11 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=args.max_rounds,
         budget_usd=args.budget,
     )
-    summary = run_task(task, cwd=args.cwd, keys=ApiKeys.from_env())
+    # The terminal CLI is the operator's own shell: the code worker is what
+    # `--cwd` exists for, and whoever typed the command is the one at risk.
+    summary = run_task(
+        task, cwd=args.cwd, keys=ApiKeys.from_env(), allow_code_worker=True
+    )
     print_summary(summary)
     return 0 if summary["status"].startswith("accepted") else 1
 
